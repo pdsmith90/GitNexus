@@ -230,6 +230,13 @@ export const CLASS_CONTAINER_TYPES = new Set([
   // Go
   'struct_type',
   'interface_type',
+  // Julia — `struct`/`mutable struct` own their fields (HAS_PROPERTY). Julia is
+  // non-OO, so a struct body contains only field declarations, never dispatch
+  // methods (those are top-level generic functions). The one exception is an
+  // inner constructor (`Foo(x) = new(x)` inside the struct) — rare, and it would
+  // be attributed as HAS_METHOD; a first-cut limitation (absent from the target
+  // repos). `abstract type` is intentionally NOT a container: it carries no fields.
+  'struct_definition',
 ]);
 
 export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
@@ -264,6 +271,8 @@ export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
   companion_object: 'Class',
   struct_type: 'Struct',
   interface_type: 'Interface',
+  // Julia
+  struct_definition: 'Struct',
 };
 
 /**
@@ -563,8 +572,19 @@ export const findEnclosingClassInfo = (
         }
       }
 
+      // A `type_head` child (Julia struct/abstract head) carries the type name
+      // in a nested position rather than a `name` field: `type_head → identifier`
+      // (`struct Foo`) or `type_head → binary_expression → identifier` (the `Foo`
+      // in `struct Foo <: Bar`). Keyed on the node type, matching how this
+      // function already special-cases `type_declaration` / `struct_type` above.
+      const typeHead = current.children?.find((c: SyntaxNode) => c.type === 'type_head');
+      const typeHeadName =
+        typeHead?.firstNamedChild?.type === 'binary_expression'
+          ? typeHead.firstNamedChild.firstNamedChild
+          : typeHead?.firstNamedChild;
       const nameNode =
         current.childForFieldName?.('name') ??
+        typeHeadName ??
         current.children?.find(
           (c: SyntaxNode) =>
             c.type === 'type_identifier' ||

@@ -52,6 +52,8 @@ export const EXTENSIONS = [
   '.swift',
   // Ruby
   '.rb',
+  // Julia
+  '.jl',
 ];
 
 /**

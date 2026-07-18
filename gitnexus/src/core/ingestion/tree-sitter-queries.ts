@@ -1764,6 +1764,98 @@ export const DART_QUERIES = `
   right: (_)) @assignment
 `;
 
+// Julia queries — verified against tree-sitter-julia 0.23.1 by parsing real
+// CubeOH source. Julia is non-OO: functions are top-level generics (a "method"
+// is a dispatch of a generic function, never a member of a struct), so we emit
+// `@definition.function` only — never `@definition.method`.
+//
+// Grammar structure (no `name:` fields on most heads):
+//   struct Foo / struct Foo <: Bar → (struct_definition (type_head (identifier)|(binary_expression . (identifier))))
+//   abstract type A / A <: B       → (abstract_definition (type_head …))  → Interface node
+//   module M                       → (module_definition name: (identifier))  ← has a named field
+//   function f(x) … end            → (function_definition (signature (call_expression . (identifier))))
+//   f(x) = expr                    → (assignment . (call_expression . (identifier)) …)  ← short form; the
+//                                     leading `.` pins call_expression as the LHS so the RHS is not matched
+//   macro m(x) … end               → (macro_definition (signature (call_expression . (identifier))))
+//   Base.@kwdef struct Foo …       → nested struct_definition inside a macrocall_expression; the query
+//                                     matches at any depth, so kwdef structs are still captured.
+//
+// Deliberately out of first-cut scope (see JULIA_SUPPORT_BRIEF.md): anonymous
+// functions, `where` type params (base type name only), do-blocks, macro-call
+// expansion. Heritage (`<:`) EXTENDS edges are NOT emitted here — the query-level
+// heritage leg was removed in #942; inheritance is synthesized as
+// `@reference.inherits` in `languages/julia/captures.ts` (scope-resolution).
+export const JULIA_QUERIES = `
+; ── Structs (Struct nodes) ────────────────────────────────────────────────────
+(struct_definition
+  (type_head (identifier) @name)) @definition.struct
+(struct_definition
+  (type_head (binary_expression . (identifier) @name))) @definition.struct
+
+; ── Abstract types (Interface nodes) ──────────────────────────────────────────
+(abstract_definition
+  (type_head (identifier) @name)) @definition.interface
+(abstract_definition
+  (type_head (binary_expression . (identifier) @name))) @definition.interface
+
+; ── Modules ───────────────────────────────────────────────────────────────────
+(module_definition
+  name: (identifier) @name) @definition.module
+
+; ── Functions ─────────────────────────────────────────────────────────────────
+; Long form: function f(args...) … end
+(function_definition
+  (signature (call_expression . (identifier) @name))) @definition.function
+; Short form: f(args...) = expr  (leading . anchors the LHS call, not the RHS).
+; Note: local short-form closures inside function bodies are also captured as
+; Function nodes in this first cut — acceptable (they are real named defs).
+(assignment .
+  (call_expression . (identifier) @name)) @definition.function
+
+; ── Macros ────────────────────────────────────────────────────────────────────
+(macro_definition
+  (signature (call_expression . (identifier) @name))) @definition.macro
+
+; ── Const ─────────────────────────────────────────────────────────────────────
+; const NAME = expr  (covers const type aliases like \`const Vec3 = NTuple{3,Float64}\`)
+(const_statement
+  (assignment . (identifier) @name)) @definition.const
+
+; ── Struct fields (Property nodes) ────────────────────────────────────────────
+; Typed field: x::T   (. anchors the field name, excluding the type identifier)
+(struct_definition
+  (typed_expression . (identifier) @name) @definition.property)
+; Bare untyped field: x   (a direct identifier child; the struct name lives under
+; type_head, so it is not matched here)
+(struct_definition
+  (identifier) @name @definition.property)
+; Field with default (Base.@kwdef / @with_kw): x::T = v  or  flag = v
+(struct_definition
+  (assignment . (typed_expression . (identifier) @name)) @definition.property)
+(struct_definition
+  (assignment . (identifier) @name) @definition.property)
+
+; ── Imports (using / import, incl. relative, selective, and aliased) ──────────
+(using_statement (identifier) @import.source) @import
+(using_statement (import_path) @import.source) @import
+(using_statement (selected_import (import_path) @import.source)) @import
+(import_statement (identifier) @import.source) @import
+(import_statement (import_path) @import.source) @import
+(import_statement (selected_import (import_path) @import.source)) @import
+(import_statement (import_alias . (identifier) @import.source)) @import
+
+; ── Calls ─────────────────────────────────────────────────────────────────────
+; Free call: f(args...)
+(call_expression . (identifier) @call.name) @call
+; Member call: recv.method(args...)
+(call_expression
+  (field_expression value: (_) (identifier) @call.name)) @call
+; Broadcast call: f.(args...)
+(broadcast_call_expression . (identifier) @call.name) @call
+(broadcast_call_expression
+  (field_expression value: (_) (identifier) @call.name)) @call
+`;
+
 import { SupportedLanguages } from 'gitnexus-shared';
 
 export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {
@@ -1783,4 +1875,5 @@ export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {
   [SupportedLanguages.Dart]: DART_QUERIES,
   [SupportedLanguages.Vue]: TYPESCRIPT_QUERIES, // Vue <script> blocks are parsed as TypeScript
   [SupportedLanguages.Cobol]: '', // Standalone regex processor — no tree-sitter queries
+  [SupportedLanguages.Julia]: JULIA_QUERIES,
 };

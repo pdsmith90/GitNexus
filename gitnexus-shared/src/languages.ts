@@ -22,4 +22,7 @@ export enum SupportedLanguages {
   Vue = 'vue',
   /** Standalone regex processor — no tree-sitter, no LanguageProvider. */
   Cobol = 'cobol',
+  /** Julia (.jl): non-OO — top-level generic functions, structs, abstract
+   *  types, modules, macros. Multiple dispatch, no methods-as-members. */
+  Julia = 'julia',
 }
