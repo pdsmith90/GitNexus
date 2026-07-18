@@ -117,6 +117,11 @@ const SMOKE_CASES: Record<string, SmokeCase> = {
     snippet: 'fun main() {}\n',
     rootType: 'source_file',
   },
+  [SupportedLanguages.Julia]: {
+    language: SupportedLanguages.Julia,
+    snippet: 'function main() end\n',
+    rootType: 'source_file',
+  },
 };
 
 describe('parser-loader ABI load-smoke (#1922)', () => {

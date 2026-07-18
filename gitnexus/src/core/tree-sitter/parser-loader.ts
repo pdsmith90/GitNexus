@@ -116,6 +116,11 @@ const SOURCES: Record<string, GrammarSource> = {
     unavailableNote:
       'Ruby parsing requires `tree-sitter-ruby`. Check the install and native binding.',
   },
+  [SupportedLanguages.Julia]: {
+    load: () => _require('tree-sitter-julia'),
+    unavailableNote:
+      'Julia parsing requires `tree-sitter-julia`. Check the install and native binding.',
+  },
   [SupportedLanguages.Vue]: {
     load: () => _require('tree-sitter-typescript').typescript,
     unavailableNote:
