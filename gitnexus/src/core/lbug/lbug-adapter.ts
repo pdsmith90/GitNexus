@@ -793,7 +793,8 @@ const doInitLbug = async (dbPath: string, readOnly: boolean = false) => {
         const realPath = await fs.realpath(dbPath);
         const parentDir = path.dirname(dbPath);
         const realParent = await fs.realpath(parentDir);
-        if (!realPath.startsWith(realParent + path.sep) && realPath !== realParent) {
+        const safePrefix = realParent.endsWith(path.sep) ? realParent : realParent + path.sep;
+        if (!realPath.startsWith(safePrefix) && realPath !== realParent) {
           throw new Error(
             `Refusing to delete ${dbPath}: resolved path ${realPath} is outside storage directory`,
           );
@@ -1286,6 +1287,13 @@ const formatCypherValue = (v: unknown): string => {
   return `'${escapeCypherString(String(v))}'`;
 };
 
+const formatCypherStringArray = (value: unknown): string => {
+  const items = Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : [];
+  return `[${items.map(formatCypherValue).join(', ')}]`;
+};
+
 /**
  * Fallback: insert relationships one-by-one if COPY fails.
  *
@@ -1375,6 +1383,9 @@ export const getCopyQuery = (table: NodeTableName, filePath: string): string => 
     // `calleeIds` is its SOUND parallel (space-joined resolved callee ids, #2227).
     return `COPY ${t}(id, filePath, startLine, endLine, text, callees, calleeIds) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
+  if (table === 'Class') {
+    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, frameworkAnnotations) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
   if (table === 'Method') {
     return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, parameterCount, returnType) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
@@ -1428,6 +1439,11 @@ export const insertNodeToLbug = async (
       // Taint/PDG substrate (issue #2080) — no name column. `calleeIds` (#2227)
       // is the sound resolved-id parallel to the leaf-name `callees` set.
       query = `CREATE (n:BasicBlock {id: ${formatCypherValue(properties.id)}, filePath: ${formatCypherValue(properties.filePath)}, startLine: ${properties.startLine || 0}, endLine: ${properties.endLine || 0}, text: ${formatCypherValue(properties.text || '')}, callees: ${formatCypherValue(properties.callees || '')}, calleeIds: ${formatCypherValue(properties.calleeIds || '')}})`;
+    } else if (label === 'Class') {
+      const descPart = properties.description
+        ? `, description: ${formatCypherValue(properties.description)}`
+        : '';
+      query = `CREATE (n:Class {id: ${formatCypherValue(properties.id)}, name: ${formatCypherValue(properties.name)}, filePath: ${formatCypherValue(properties.filePath)}, startLine: ${properties.startLine || 0}, endLine: ${properties.endLine || 0}, isExported: ${!!properties.isExported}, content: ${formatCypherValue(properties.content || '')}${descPart}, frameworkAnnotations: ${formatCypherStringArray(properties.frameworkAnnotations)}})`;
     } else if (TABLES_WITH_EXPORTED.has(label)) {
       const descPart = properties.description
         ? `, description: ${formatCypherValue(properties.description)}`
@@ -1513,6 +1529,11 @@ export const batchInsertNodesToLbug = async (
           // Taint/PDG substrate (issue #2080) — no name column. `calleeIds`
           // (#2227) is the sound resolved-id parallel to the `callees` set.
           query = `MERGE (n:BasicBlock {id: ${formatCypherValue(properties.id)}}) SET n.filePath = ${formatCypherValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.text = ${formatCypherValue(properties.text || '')}, n.callees = ${formatCypherValue(properties.callees || '')}, n.calleeIds = ${formatCypherValue(properties.calleeIds || '')}`;
+        } else if (label === 'Class') {
+          const descPart = properties.description
+            ? `, n.description = ${formatCypherValue(properties.description)}`
+            : '';
+          query = `MERGE (n:Class {id: ${formatCypherValue(properties.id)}}) SET n.name = ${formatCypherValue(properties.name)}, n.filePath = ${formatCypherValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.isExported = ${!!properties.isExported}, n.content = ${formatCypherValue(properties.content || '')}${descPart}, n.frameworkAnnotations = ${formatCypherStringArray(properties.frameworkAnnotations)}`;
         } else if (TABLES_WITH_EXPORTED.has(label)) {
           const descPart = properties.description
             ? `, n.description = ${formatCypherValue(properties.description)}`
@@ -2883,7 +2904,30 @@ export const queryFTS = async (
 };
 
 /**
- * Drop an FTS index
+ * True for the two benign "nothing to drop" `DROP_FTS_INDEX` failures —
+ * both catalog/binder exceptions, LadybugDB's classes for "this name isn't
+ * bound to anything right now" (probe-verified end-to-end through
+ * `dropFTSIndex`'s real `conn.query()` path against @ladybugdb/core
+ * 0.18.x): the named index was never created (`Binder exception: Table <T>
+ * doesn't have an index with name <name>.`), or the FTS extension/function
+ * isn't registered at all (`Catalog exception: function DROP_FTS_INDEX is
+ * not defined...`). A real engine failure — e.g. the `Runtime exception:
+ * FTS index '<name>' is inconsistent: ...` class from #2589 — is a
+ * DIFFERENT exception class (an execution-time failure, not a catalog/bind
+ * lookup miss), so this returns false for it. Anchored to the START of the
+ * message (not a bare substring search): every probed LadybugDB error leads
+ * with its exception class, and anchoring means a future message that merely
+ * mentions "Binder exception" or "Catalog exception" further in in the body
+ * of an otherwise-genuine failure can't be misclassified as benign. Pure
+ * string logic so it is unit-testable without a native LadybugDB connection.
+ */
+export const isBenignDropFtsIndexError = (message: string): boolean =>
+  message.startsWith('Binder exception:') || message.startsWith('Catalog exception:');
+
+/**
+ * Drop an FTS index. Tolerates only {@link isBenignDropFtsIndexError} —
+ * anything else rethrows instead of being silently masked, which previously
+ * let a corrupted index persist across analyze runs undetected.
  */
 export const dropFTSIndex = async (tableName: string, indexName: string): Promise<void> => {
   if (!conn) {
@@ -2892,8 +2936,11 @@ export const dropFTSIndex = async (tableName: string, indexName: string): Promis
 
   try {
     await queryAndDrain(conn, `CALL DROP_FTS_INDEX('${tableName}', '${indexName}')`);
-  } catch {
-    // Index may not exist
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!isBenignDropFtsIndexError(msg)) {
+      throw e;
+    }
   } finally {
     ensuredFTSIndexes.delete(ftsIndexKey(tableName, indexName));
   }
