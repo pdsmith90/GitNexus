@@ -437,8 +437,38 @@ export interface RepoMeta {
  * `Record` node and its `HAS_METHOD` edges for every unchanged record file
  * (same v7 contract: new nodes/edges the incremental path would otherwise
  * never backfill); force a full re-analyze instead.
+ * v11: Rust abstract trait methods (`fn foo(&self) -> T;`, no body) now get a
+ * scope + declaration capture (#2604): RUST_SCOPE_QUERY had no
+ * `function_signature_item` pattern, so a `&dyn Trait` receiver could never
+ * dispatch a CALLS edge to the trait's own method. Same v7/v10 contract: the
+ * incremental write set only covers changed files, so a top-up against a
+ * pre-v11 index would keep silently missing these CALLS edges for every
+ * unchanged Rust trait file; force a full re-analyze instead.
+ * v12: Rust range-binding stopped restoring ambiguous duplicate type names
+ * (#2514): a function/struct name defined three or more times used to
+ * re-resolve to the last-scanned file (a presence toggle), so odd duplicate
+ * counts emitted a wrong cross-file CALLS edge. Same v7/v11 contract: the
+ * incremental write set only covers changed files, so a top-up against a
+ * pre-v12 index would keep these spurious CALLS edges on every unchanged Rust
+ * file. v12 also changes edges in the other direction: range-binding now
+ * RESOLVES import-disambiguated duplicate names (`for item in make()` /
+ * `let Struct { f } = ..` where a `use` or `use x::*` import pins one of several
+ * same-named definitions) to the imported definition's type. Both the removed
+ * spurious edges and these new resolved edges are cross-file, so a pre-v12
+ * top-up would leave unchanged Rust files stale either way; force a full
+ * re-analyze instead.
+ * v13: Java local classes, enums, records, and interfaces use
+ * source-type-relative JLS 13.1 identities (`Outer$1Local`). Number allocation
+ * matches javac: one sequence per (enclosing type, local simple name), with a
+ * separate sequence for anonymous types. Existing type/member ids, lexical
+ * bindings, and ownership edges must not be mixed with newly named unchanged
+ * Java files; force a full re-analyze.
+ * v14: C# and Kotlin free-call fallback now rejects same-file methods whose
+ * instance owner is outside the caller's enclosing class/MRO (#2563). The
+ * incremental write set would otherwise retain those stale CALLS edges on
+ * every unchanged C# and Kotlin file; force a full re-analyze instead.
  */
-export const INCREMENTAL_SCHEMA_VERSION = 10;
+export const INCREMENTAL_SCHEMA_VERSION = 14;
 
 export interface IndexedRepo {
   repoPath: string;
