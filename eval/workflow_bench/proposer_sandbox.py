@@ -27,7 +27,17 @@ SANDBOX_TMP = "/tmp"
 SANDBOX_CLAUDE = "/opt/claude/claude"
 SANDBOX_SHELL_PREFIX = "/opt/claude/shell-prefix"
 SANDBOX_PYTHON3 = "/opt/claude/python3"
-SANDBOX_PATH = "/opt/claude:/usr/local/bin:/usr/bin:/bin"
+SANDBOX_NODE = "/opt/claude/node"
+SANDBOX_NODE_PREFIX = "/opt/claude/nodejs"
+# Vite transpiles a TypeScript config into <node_modules>/.vite-temp before it
+# loads anything, so a read-only dependency mount makes `vitest` die with EROFS
+# before a single test runs -- and every task verify command and every hidden
+# oracle ends in `npx vitest run <test>`. bwrap cannot create a mount point
+# inside an already-read-only bind, so the directory is captured into the
+# dependency snapshot (task_assets.py) and a tmpfs is overlaid on it here.
+VITE_TEMP_DIR = ".vite-temp"
+DEPENDENCY_MOUNT_BASENAME = "node_modules"
+SANDBOX_PATH = f"/opt/claude:{SANDBOX_NODE_PREFIX}/bin:/usr/local/bin:/usr/bin:/bin"
 SANDBOX_GITNEXUS = "/opt/gitnexus"
 SANDBOX_GITNEXUS_SHARED = "/opt/gitnexus-shared"
 SANDBOX_GITNEXUS_REGISTRY = "/opt/gitnexus-registry"
@@ -350,10 +360,58 @@ def build_claude_settings() -> str:
 
 def _runtime_mount_args() -> list[str]:
     args: list[str] = []
-    for raw in ("/usr", "/bin", "/lib", "/lib64"):
+    system_trees = ("/usr", "/bin", "/lib", "/lib64")
+    for raw in system_trees:
         path = Path(raw)
         if path.exists():
             args += ["--ro-bind", raw, raw]
+    # sanitized_graph.py and runner_sessions.py invoke the sandboxed graph
+    # CLI via SANDBOX_NODE. Bind whatever `node` actually resolves to on PATH
+    # there -- true node location varies by host (GitHub-hosted runner images
+    # happen to have one under /usr/local/bin; a self-hosted runner's
+    # actions/setup-node installs into its own tool-cache directory instead).
+    # Target must be a fresh path like /opt/claude/... rather than anywhere
+    # under /usr, /bin, /lib, or /lib64: those are already read-only bound
+    # above, and bwrap can't create a new mount-point file inside an
+    # already-read-only tree when the real path doesn't already exist there
+    # (the exact case a self-hosted runner hits, and the reason this bind
+    # exists at all).
+    node_bin = shutil.which("node")
+    if node_bin:
+        args += ["--ro-bind", node_bin, SANDBOX_NODE]
+        # The single-binary bind above gives SANDBOX_NODE but NOT npm or npx:
+        # those are symlinks into ../lib/node_modules/npm/bin/*-cli.js, so the
+        # install prefix carrying both bin/ and lib/node_modules has to be
+        # mounted for them to resolve at all. When node really lives under a
+        # system tree (/usr/local/bin on GitHub-hosted images) the prefix is
+        # already inside the wholesale read-only binds above and npm/npx came
+        # along for free -- which is exactly why this gap stayed invisible
+        # until a self-hosted runner put node in actions/setup-node's tool
+        # cache, outside /usr, and every task verify command
+        # ("cd gitnexus && npx tsc ... && npx vitest ...") died with
+        # "/bin/sh: 1: npx: not found". Skip the redundant bind in the
+        # already-covered case so the mount surface stays minimal.
+        #
+        # The prefix is only ever derived from a real <prefix>/bin/node layout
+        # that actually carries npm. Deriving it as parent.parent unconditionally
+        # would mount an unrelated ancestor whenever node sits somewhere else:
+        # /opt/bin/node would bind all of /opt (every tool cache on a hosted
+        # runner) and a bare <dir>/node would bind <dir>'s parent. This function
+        # exists to keep the sandbox surface minimal, so an unrecognized layout
+        # binds nothing extra and simply leaves npx unavailable, exactly as
+        # before.
+        node_bin_dir = Path(node_bin).resolve().parent
+        node_prefix = node_bin_dir.parent
+        # Test the property actually needed -- a working npx next to node in a
+        # real bin/ directory -- rather than a proxy like lib/node_modules/npm.
+        # .exists() follows the symlink, so a dangling npx correctly fails: it
+        # would not survive the mount either. Requiring the "bin" name keeps
+        # the parent.parent derivation honest; an npx sitting directly beside
+        # node in a flat directory would make that derivation name the wrong
+        # prefix.
+        provides_npx = node_bin_dir.name == "bin" and (node_bin_dir / "npx").exists()
+        if provides_npx and not any(node_prefix.is_relative_to(tree) for tree in system_trees):
+            args += ["--ro-bind", str(node_prefix), SANDBOX_NODE_PREFIX]
     for raw in (
         "/etc/ssl",
         "/etc/hosts",
@@ -398,7 +456,7 @@ def _create_python3_wrapper(private_root: Path) -> Path:
     """
 
     wrapper = private_root / "python3"
-    wrapper.write_text("#!/bin/bash\nset -eu\nexec /usr/bin/python3 \"$@\"\n")
+    wrapper.write_text('#!/bin/bash\nset -eu\nexec /usr/bin/python3 "$@"\n')
     wrapper.chmod(0o500)
     return wrapper
 
@@ -628,6 +686,20 @@ def _sandbox_command_prefix(
     ]
     for mount in mounts:
         args += ["--ro-bind", str(mount.source), mount.target]
+        # Overlay an empty writable tmpfs on the one path vite must write.
+        # Everything else in the mount, and the whole workspace, stays
+        # read-only, and the overlay lives only inside the sandbox -- it never
+        # reaches the host clone the credited patch is captured from.
+        #
+        # Gate on the mount SOURCE actually containing the directory, not on
+        # the target name: bwrap cannot create a mount point inside an
+        # already-read-only bind, so a tmpfs can only be overlaid where the
+        # directory already exists in the bound bytes. task_assets.py captures
+        # it into dependency-snapshot node_modules; other node_modules mounts
+        # (e.g. the trusted GitNexus runtime at /opt/gitnexus/node_modules) do
+        # not carry it, and overlaying them would fail with EROFS.
+        if PurePosixPath(mount.target).name == DEPENDENCY_MOUNT_BASENAME and (mount.source / VITE_TEMP_DIR).is_dir():
+            args += ["--tmpfs", f"{mount.target}/{VITE_TEMP_DIR}"]
     args += ["--chdir", SANDBOX_WORKSPACE, "--"]
     return args
 

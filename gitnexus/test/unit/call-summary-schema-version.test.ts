@@ -73,8 +73,8 @@ describe('CALL_SUMMARY relation-type exclusion (U-C1)', () => {
 });
 
 describe('CALL_SUMMARY incremental reuse gate (U-C5)', () => {
-  it('INCREMENTAL_SCHEMA_VERSION is bumped to 10 (Java record container-node re-index window)', () => {
-    expect(INCREMENTAL_SCHEMA_VERSION).toBe(10);
+  it('INCREMENTAL_SCHEMA_VERSION is bumped to 14 (C#/Kotlin instance-ownership free-call gate, #2563)', () => {
+    expect(INCREMENTAL_SCHEMA_VERSION).toBe(14);
   });
 
   it('a pre-current stamp fails the `=== INCREMENTAL_SCHEMA_VERSION` reuse gate → forces full re-analyze', () => {
@@ -112,7 +112,23 @@ describe('CALL_SUMMARY incremental reuse gate (U-C5)', () => {
     // (#2564) — a record's methods would keep being ownerless Method nodes
     // with no HAS_METHOD edge on unchanged files → must NOT reuse.
     expect(passesReuseGate(9)).toBe(false);
+    // A pre-v11 (v10) index predates the Rust dyn-trait-object dispatch fix
+    // (#2604) — abstract trait methods would keep being uncaptured (no
+    // ownerId/CALLS resolution) on unchanged Rust trait files → must NOT reuse.
+    expect(passesReuseGate(10)).toBe(false);
+    // A pre-v12 (v11) index predates the #2514 Rust range-binding fix — the
+    // ambiguity latch removes spurious cross-file CALLS edges and the
+    // import-disambiguated resolution adds new ones on unchanged Rust files,
+    // neither of which reach an incremental write set → must NOT reuse.
+    expect(passesReuseGate(11)).toBe(false);
+    // A pre-v13 (v12) index predates javac-compatible Java local-type
+    // identities and lexical visibility scopes (#2562), so unchanged
+    // simple-name-keyed type/member ids must not survive.
+    expect(passesReuseGate(12)).toBe(false);
+    // A pre-v14 (v13) index predates the C#/Kotlin instance-ownership gate,
+    // so unchanged files may retain spurious same-file CALLS edges.
+    expect(passesReuseGate(13)).toBe(false);
     // A current-version stamp passes the gate (incremental top-up eligible).
-    expect(passesReuseGate(10)).toBe(true);
+    expect(passesReuseGate(14)).toBe(true);
   });
 });
