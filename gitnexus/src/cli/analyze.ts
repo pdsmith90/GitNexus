@@ -1610,6 +1610,18 @@ const analyzeCommandImpl = async (
       return;
     }
 
+    // FTS repair/verify pre-flight guards (run-analyze.ts `--repair-fts` path):
+    // all surface as actionable "Cannot repair FTS indexes: …" / "FTS repair
+    // failed …" messages (e.g. the index is mid-incremental-recovery, or the
+    // graph store is missing). Render them clean — like the WAL/collision
+    // branches — instead of a raw stack trace, which read as a crash and trapped
+    // users in a query → repair-fts → doctor loop.
+    if (msg.startsWith('Cannot repair FTS indexes:') || msg.startsWith('FTS repair failed')) {
+      cliError(`  ${msg.replace(/\n/g, '\n  ')}\n`, { recoveryHint: 'fts-repair-blocked' });
+      process.exitCode = 1;
+      return;
+    }
+
     // WAL corruption — the index file is unreadable. Give a clear recovery
     // path without a confusing stack trace (the native error message alone
     // is enough signal).

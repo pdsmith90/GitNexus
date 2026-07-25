@@ -48,6 +48,7 @@ export type RecoveryHint =
   | 'wal-checkpoint-threshold'
   | 'lbug-wipe-failed'
   | 'lbug-page-size'
+  | 'fts-repair-blocked'
   | 'heap-oom-respawn'
   | 'native-worker-abort'
   | 'hf-endpoint-unreachable'
