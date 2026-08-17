@@ -18,21 +18,41 @@ import fs from 'fs/promises';
 import { realpathSync } from 'fs';
 import path from 'path';
 import os from 'os';
-import { randomBytes } from 'crypto';
-import { getInferredRepoName, resolveRepoIdentityRoot } from './git.js';
-import { retryRename } from './fs-atomic.js';
+import { getInferredRepoName, resolveRepoIdentityRoot, stripUrlCredentials } from './git.js';
+import { stripWindowsLongPathPrefix } from '../lib/utils.js';
+import { writeFileAtomic } from './fs-atomic.js';
 import { logger } from '../core/logger.js';
+import { acquireIndexLock, IndexLockTimeoutError, type IndexLockHandle } from './index-lock.js';
 import {
   branchSlug,
   BRANCHES_DIR,
   resolveBranchPlacement,
   type BranchSummary,
 } from './branch-index.js';
+import {
+  GITNEXUS_DIR,
+  INDEX_METADATA_FILE,
+  LEGACY_METADATA_FILE,
+  getStoragePath,
+  isMissingFilesystemError,
+  loadMeta,
+  tryReadMetaFile,
+  type AnalyzerRunnerIdentity,
+  type RepoMeta,
+} from './repo-meta.js';
 
 // Re-export the #2106 branch primitives (extracted to branch-index.ts, R10) so
 // existing `repo-manager` import sites and tests keep working unchanged.
 export { branchSlug, resolveBranchPlacement };
 export type { BranchSummary };
+
+// Re-export the metadata primitives (extracted to repo-meta.ts) for the same
+// reason. They moved DOWN a layer so `branch-index.ts` can read the flat slot's
+// metadata without importing back out of this module — see repo-meta.ts for the
+// cycle that made the extraction necessary. `LEGACY_METADATA_FILE` and
+// `tryReadMetaFile` stay module-private here, exactly as before.
+export { getStoragePath, INDEX_METADATA_FILE, isMissingFilesystemError, loadMeta };
+export type { AnalyzerRunnerIdentity, RepoMeta };
 
 /**
  * Normalise a repo path for registry comparison across platforms
@@ -49,6 +69,20 @@ export type { BranchSummary };
  *     form (`RUNNERA~1\...`), but `process.cwd()` often returns the
  *     long form (`runneradmin\...`). `realpathSync.native` normalises
  *     both sides to the long-name canonical path.
+ *   - **Windows, extended-length paths** (#2667): a caller can supply a
+ *     `\\?\`-prefixed path — the usual MAX_PATH workaround — and
+ *     `path.resolve` preserves the prefix, so the string compare below
+ *     never matches the un-prefixed entry the registry stores. The
+ *     realpath branch already dropped it (libuv strips the prefix inside
+ *     `fs__realpath`), but the fallback branch did not, which is exactly
+ *     the branch a missing path takes. `stripWindowsLongPathPrefix` is
+ *     applied to both so the two branches agree.
+ *
+ * This normalisation is safe here precisely because the result is only ever
+ * compared, never opened: Node does NOT re-add `\\?\` for over-MAX_PATH
+ * paths, so an fs-facing path must keep whatever form the caller gave it.
+ * See the `registerRepo` comment on applying canonicalisation at COMPARE
+ * points only.
  *
  * Fallback behaviour: if the path does not exist on disk (e.g. a user
  * passed `gitnexus remove some-alias` and the alias misses every
@@ -60,16 +94,16 @@ export type { BranchSummary };
  * Backwards compatibility: this function is applied to BOTH the
  * caller-supplied input AND each stored `entry.path` at compare time
  * inside `resolveRegistryEntry`, so registries written by older
- * versions (where `registerRepo` only ran `path.resolve`) still match
- * correctly. Newly-written entries are canonicalised at write time too
- * so the registry stabilises over analyze/re-analyze cycles.
+ * versions still match correctly. Entries are NOT canonicalised at
+ * write time — `registerRepo` stores `path.resolve(repoPath)` — which
+ * is what makes the compare-only rule above hold.
  */
 export const canonicalizePath = (p: string): string => {
   const resolved = path.resolve(p);
   try {
-    return realpathSync.native(resolved);
+    return stripWindowsLongPathPrefix(realpathSync.native(resolved));
   } catch {
-    return resolved;
+    return stripWindowsLongPathPrefix(resolved);
   }
 };
 
@@ -95,380 +129,6 @@ export const registryPathEquals = (a: string, b: string): boolean =>
  */
 export const cloneDirBelongsToEntry = (cloneDir: string, entryPath: string): boolean =>
   registryPathEquals(canonicalizePath(cloneDir), canonicalizePath(entryPath));
-
-/**
- * Versioned receipt for the analyzer process that produced an index.
- *
- * Paths identify the resolved runtime and invoked GitNexus entry artifact on
- * this machine. The entry artifact is diagnostic (CLI and server-worker entry
- * files differ); semantic freshness compares the runtime/build/dependency
- * fields. SHA-256 digests make the receipt independently reproducible:
- * `invokedArtifact.digest` covers the entry file, `build.digest` covers the
- * complete source or distribution tree, and `dependencyRuntime.digest` covers
- * the applicable lockfile, resolved runtime package metadata, and every
- * content-addressed package payload (including JS/JSON/native/Wasm inputs)
- * using the canonicalizations defined in `core/analyzer-identity.ts`.
- */
-export interface AnalyzerRunnerIdentity {
-  schemaVersion: 4;
-  runtime: {
-    executablePath: string;
-    version: string;
-    platform: string;
-    architecture: string;
-    modulesAbi: string;
-    libc: string;
-  };
-  cliVersion: string;
-  invokedArtifact: {
-    path: string;
-    digest: string;
-  };
-  build: {
-    kind: 'source' | 'distribution';
-    rootPath: string;
-    canonicalization: 'gitnexus-analyzer-build-v2';
-    digest: string;
-  };
-  dependencyRuntime: {
-    manifestPath: string;
-    lockfilePath: string | null;
-    canonicalization: 'gitnexus-analyzer-dependency-runtime-v4';
-    packageCount: number;
-    artifactCount: number;
-    digest: string;
-  };
-}
-
-export interface RepoMeta {
-  repoPath: string;
-  lastCommit: string;
-  indexedAt: string;
-  /**
-   * Analyzer/runtime receipt for the successful run represented by this
-   * metadata. Optional so indexes written by older GitNexus releases remain
-   * readable; a missing value means provenance is unknown, never that it
-   * matches the currently invoked analyzer.
-   */
-  runnerIdentity?: AnalyzerRunnerIdentity;
-  /**
-   * Canonical `origin` remote URL captured at index time. Used to
-   * fingerprint the same logical repo across multiple on-disk clones
-   * (worktrees, agent workspaces, "clean clone for indexing"). When
-   * absent (no remote configured, git unavailable, etc.) the repo is
-   * treated as path-only and sibling-clone detection is skipped.
-   */
-  remoteUrl?: string;
-  stats?: {
-    files?: number;
-    nodes?: number;
-    edges?: number;
-    communities?: number;
-    processes?: number;
-    embeddings?: number;
-  };
-  /**
-   * Capability stamps for what THIS analyze run actually produced (mirrors
-   * the meta literal in run-analyze.ts — typed here so the stamp site is
-   * compile-checked; tri-review 4669518496 P1/U3: `vectorSearch.status`
-   * must never claim 'vector-index' unless the run verified or recreated
-   * the HNSW index). Forensic today — no programmatic readers (`doctor`
-   * prints platform-derived capabilities, query routing never consults
-   * meta). The status unions mirror `CapabilityStatus` /
-   * `SemanticSearchMode` in core/platform/capabilities.ts; inlined to keep
-   * storage/ free of a core/ type dependency.
-   */
-  capabilities?: {
-    graph: { provider: string; status: 'available' | 'degraded' | 'unavailable' };
-    fts: { provider: string; status: 'available' | 'degraded' | 'unavailable' };
-    vectorSearch: {
-      provider: string;
-      status: 'vector-index' | 'exact-scan' | 'unavailable';
-      exactScanLimit: number;
-      reason?: string;
-    };
-  };
-  /**
-   * Bumped whenever incremental-indexing invariants change in an
-   * incompatible way (delete-and-rewrite logic, subgraph extraction,
-   * graph-wide node handling). On mismatch, runFullAnalysis forces a
-   * full rebuild rather than risk an inconsistent incremental update.
-   */
-  schemaVersion?: number;
-  /**
-   * Exact versions of independently-gated analysis capabilities produced by
-   * the successful run. Unlike schemaVersion, these may apply only to repos
-   * containing relevant source files.
-   */
-  analysisFeatures?: Record<string, number>;
-  /**
-   * The resolved GITNEXUS_FTS_CJK_SEGMENTATION mode ('none' | 'bigram') the
-   * existing index's content/description columns were last written under
-   * (#2331/#2339). On mismatch with the live process's resolved mode,
-   * runFullAnalysis forces a full rebuild so indexed text and query-time
-   * segmentation never diverge. Always stamped (never omitted), unlike
-   * `pdg` below — the default 'none' is itself a meaningful value to
-   * compare, not an absence.
-   */
-  cjkSegmentation?: string;
-  /**
-   * SHA-256 of every file's content at the time of the last successful
-   * indexing run. The next run computes current hashes and diffs against
-   * this map to determine which files' DB rows must be replaced.
-   * Map keys are repo-relative paths.
-   */
-  fileHashes?: Record<string, string>;
-  /**
-   * Crash-recovery dirty flag — a generic marker written to the metadata
-   * file (gitnexus.json + its meta.json mirror) BEFORE any destructive DB
-   * mutation by BOTH writeback branches (incremental since its introduction;
-   * full rebuilds over an existing meta since #2099 F1); cleared on success
-   * by overwriting the metadata file. If a run crashes between, the next
-   * run sees the flag and forces a full rebuild — the cheapest path back
-   * to a known-good index.
-   */
-  incrementalInProgress?: {
-    /** When the run started (epoch ms). */
-    startedAt: number;
-    /** Last dirty-flag refresh (epoch ms). */
-    updatedAt?: number;
-    /** Number of files in the writable set, for diagnostic logs.
-     *  `0` on the full-rebuild path (no incremental write set exists). */
-    toWriteCount: number;
-    /** Last completed writeback phase before the process stopped. */
-    phase?: string;
-    /** Directly changed/added files before importer expansion. */
-    directWriteCount?: number;
-    /** Extra files pulled into the writable set by importer BFS. */
-    importerExpansion?: number;
-    /** Files in the effective write set after graph-boundary expansion. */
-    effectiveWriteCount?: number;
-    /** Files whose persisted rows were scheduled for deletion. */
-    deleteCount?: number;
-    /** Added-file shadow seeds included in importer BFS. */
-    shadowSeedCount?: number;
-    /** Importer-BFS chunks dropped by failed IMPORTS queries (#2410 +
-     *  tri-review 4669518496 P2-5). Stamped only when > 0: a dropped chunk
-     *  means the importer expansion silently shrank, so a crash's
-     *  diagnostics must show whether the write set was already
-     *  under-expanded when the run died. */
-    droppedImporterChunks?: number;
-  };
-  /**
-   * Durable embedding-resume marker. Before a bounded write window begins,
-   * `pendingNodeIds` records every node that could become partially persisted;
-   * after the LadybugDB checkpoint it is cleared while progress is retained.
-   * A matching runtime resumes from persisted hashes and regenerates pending
-   * nodes; a model or dimension mismatch fails before mutation.
-   */
-  embeddingCheckpoint?: {
-    at: string;
-    nodesProcessed: number;
-    totalNodes: number;
-    chunksProcessed: number;
-    model: string;
-    dimensions: number;
-    /** `local` or a secret-free SHA-256 fingerprint of the HTTP endpoint identity. */
-    provider: string;
-    /**
-     * Nodes in the current checkpoint window. Any of these may have only a
-     * subset of their chunks persisted after an abrupt process termination,
-     * so resume must delete and regenerate them even when a persisted row has
-     * the current content hash.
-     */
-    pendingNodeIds?: string[];
-  };
-  /**
-   * Name of the git branch this index represents (#2106). Absent for the
-   * default/legacy single-branch case so the flat metadata file stays
-   * byte-identical to pre-multi-branch output. When present in the FLAT
-   * metadata file, it records which branch "owns" the flat slot (the first
-   * branch indexed); per-branch indexes under `branches/<slug>/` always carry
-   * their own `branch`.
-   */
-  branch?: string;
-  /**
-   * The parse-cache chunk keys this branch's index needs (#2106 R6). The
-   * parse-cache and durable parsedfile store live ONCE at the repo root and are
-   * shared across branches; recording each branch's live chunk keys lets the
-   * prune step union them so re-analyzing one branch doesn't evict another
-   * branch's still-live shards. Additive/optional; absent in legacy metas.
-   */
-  cacheKeys?: string[];
-  /**
-   * The effective `--pdg` configuration this index's DB rows were built
-   * under (#2099 F1). Presence ≡ the BasicBlock/CFG layer exists in the DB;
-   * ABSENT ≡ pdg-off — which covers every legacy meta, since `--pdg`
-   * shipped opt-in. Caps are recorded RESOLVED (defaults applied) so an
-   * explicit-default run compares equal to a default run. run-analyze
-   * compares this against the requested options and forces a full
-   * writeback on any mismatch — the incremental path only persists
-   * changed-file nodes and would otherwise silently drop (or strand) the
-   * CFG layer on a mode flip. Additive/optional, no
-   * INCREMENTAL_SCHEMA_VERSION bump (a bump would force a one-time full
-   * rebuild for every user). NOTE the removal mechanism is load-bearing:
-   * the end-of-run meta is a fresh object literal, NOT a spread of the
-   * prior meta, so omitting this field on a pdg-off run is what clears
-   * the stamp after an on→off flip.
-   */
-  pdg?: {
-    /** Worker-side per-function source-line cap, resolved (0 = unlimited). */
-    maxFunctionLines: number;
-    /** Emit-side per-function CFG edge cap, resolved (0 = unlimited). */
-    maxEdgesPerFunction: number;
-    /**
-     * Emit-side per-function REACHING_DEF edge cap, resolved (0 = unlimited;
-     * #2082 M2). ABSENT on an M1-era stamp — which is exactly what makes
-     * `pdgModeMismatch` trip on the first M2 run over an M1 index and force
-     * the full writeback that populates REACHING_DEF rows. Optional in the
-     * type for that reason; resolved (always present) on every M2+ write.
-     */
-    maxReachingDefEdgesPerFunction?: number;
-    /**
-     * Emit-side per-function CDG (control-dependence) edge cap, resolved
-     * (0 = unlimited; #2085 M5). ABSENT on any pre-M5 stamp — that absence is
-     * what trips `pdgModeMismatch` on the first CDG-aware run and forces the
-     * full writeback that materialises CDG edges. Optional for that upgrade
-     * reason; resolved (always present) on every M5+ write.
-     */
-    maxCdgEdgesPerFunction?: number;
-    /**
-     * Per-function taint findings cap, resolved (0 = unlimited; #2083 M3).
-     * ABSENT on an M1/M2-era stamp — like `maxReachingDefEdgesPerFunction`,
-     * that absence is what trips `pdgModeMismatch` on the first M3 run and
-     * forces the full writeback that populates TAINTED/SANITIZES rows.
-     */
-    maxTaintFindingsPerFunction?: number;
-    /** Per-finding taint hop cap, resolved (0 = unlimited; #2083 M3 KTD6 —
-     *  bounds the persisted hop-encoded `reason`). Optional for the same
-     *  M2-era-stamp upgrade reason as the findings cap. */
-    maxTaintHops?: number;
-    /**
-     * Per-run cross-function caps, resolved (0 = unlimited; #2084 M4 review
-     * P1-3). ABSENT on an M3-era stamp — that absence trips `pdgModeMismatch`
-     * on the first run that adds them and forces the full writeback that
-     * re-materialises TAINT_PATH within bounds. Optional for that upgrade
-     * reason; resolved (always present) on every post-fix write.
-     */
-    maxInterprocFindings?: number;
-    maxInterprocHops?: number;
-    maxInterprocEdges?: number;
-    /**
-     * Digest of the built-in taint model the persisted findings were
-     * produced under (#2083 M3 KTD7/R7). Any model-content change ships a
-     * new digest → mismatch → full writeback repopulates taint edges
-     * without `--force`. Optional: absent on pre-M3 stamps.
-     */
-    taintModelVersion?: string;
-    /**
-     * Identity of the reaching-definitions solver the persisted REACHING_DEF
-     * rows were produced under (#2201 review R3). The SSA-sparse rewrite computes
-     * FULL facts for deep-loop functions the old dense worklist truncated to
-     * empty (the blocks×64 ceiling no longer fires) — but an existing `--pdg`
-     * index built under the old solver carries those truncated rows. ABSENT on
-     * any pre-#2201 stamp, so that absence trips `pdgModeMismatch` on the first
-     * upgraded run and forces the full writeback that recomputes the now-fuller
-     * REACHING_DEF coverage without `--force`. Bump the tag on any future change
-     * that alters which facts the solver emits. Optional for that upgrade reason;
-     * resolved (always present) on every post-#2201 write.
-     */
-    reachingDefSolver?: string;
-    /**
-     * Whether this `--pdg` index recorded the FU-C `CALL_SUMMARY` return-value
-     * ascent layer (per-callee param→return summary edges). `true` on every
-     * FU-C+ (v4) write. ABSENT on any pre-FU-C (v3) `--pdg` stamp — that absence
-     * is what tells `impact`'s PDG mode the index predates CALL_SUMMARY, so it
-     * surfaces a "no return-value ascent (re-index for CALL_SUMMARY)" note while
-     * STILL serving the intra slice. CALL_SUMMARY is deliberately NOT a required
-     * sub-layer for `pdgLayerStatus` to report `'ready'`: a v3 index stays fully
-     * usable for the intra-procedural statement slice; only the ascent upgrade is
-     * unavailable. Optional for that back-compat reason.
-     */
-    hasCallSummary?: boolean;
-  };
-}
-
-/**
- * Bumped whenever incremental-indexing invariants change incompatibly.
- * v2: `BasicBlock.callees` column added (statement-precise inter-procedural
- * reach substrate) — an index built before this lacks the column, so a full
- * re-analyze is required rather than an incremental top-up.
- * v3: `BasicBlock.calleeIds` column added (sound resolved-callee-id parallel
- * to `callees`, #2227) — same contract: an index built before this lacks the
- * column, so a full re-analyze is forced rather than an incremental top-up.
- * v4: `CALL_SUMMARY` relation type added (per-callee RETURN-VALUE ASCENT
- * summary edges, PDG FU-C). A pre-v4 `--pdg` index has NO CALL_SUMMARY edges,
- * so the engine would silently UNDER-REPORT return-value ascent on an
- * incremental top-up; force a full re-analyze instead (same contract as v2/v3).
- * This single bump covers the whole FU-C re-index window (and the later FU-B-2).
- * v5: `Route` node identity changed to `(method, url)` (#2289 — a same-URL
- * GET/POST pair is now two distinct Route nodes). Every declarative-route node
- * id moved from `Route:/x` to `Route:GET /x` (filesystem routes keep their
- * URL-only id). The incremental writeback preserves unchanged-file rows, so a
- * top-up against a pre-v5 index would strand old url-keyed Route nodes alongside
- * new composite-keyed ones — force a full re-analyze instead.
- * v6: line-number storage flipped to uniform 0-based for the last 1-based
- * GraphNode emitters — COBOL/JCL/markdown/scope (#2377/#2379/#2380). Incremental
- * writeback preserves unchanged-file rows, so a top-up against a pre-v6 index
- * would MIX old 1-based rows with new 0-based ones — and the 1-based MCP display
- * would render the stale rows one line too high — so force a full re-analyze.
- * v7: callable-value-flow CALLS/USES edges added (#2437/#2522) — new edges can
- * connect two files whose content did not change, but the incremental write set
- * only covers changed files (`computeEffectiveWriteSet`), so a top-up against a
- * pre-v7 index would silently omit the new edges for every unchanged file pair;
- * force a full re-analyze instead (same contract as v2–v6).
- * v8: Java anonymous class bodies became first-class Class nodes (#2550):
- * `new Runnable() { run(){} }` now emits `Class:...:Worker$1` and its methods
- * re-keyed from `Worker.run` to `Worker$1.run`. Node identities move on
- * unchanged files — a top-up against a pre-v8 index would strand the old
- * `Worker.run`-keyed Method nodes alongside the new ones (the v5 Route
- * precedent); force a full re-analyze instead.
- * v9: Java enum constant bodies joined the instance model and anonymous
- * naming switched to JLS 13.1 immediately-enclosing-type chains (#2555): `enum E { A {
- * hook(){} } }` now emits `Class:...:E$1` with methods re-keyed from
- * `E.hook` to `E$1.hook`, and nested-host anonymous names re-key
- * (`EnumWrap$1` → `EnumWrap$Mode$1`). Same contract as v8: identities move
- * on unchanged files; force a full re-analyze.
- * v10: Java `record_declaration` now emits a first-class `Record` graph node
- * (#2564): a record's container node was previously never created (JAVA_QUERIES
- * had no capture for it), so its methods existed as ownerless Method nodes
- * with no `HAS_METHOD` edge. The incremental write set only covers changed
- * files — a top-up against a pre-v10 index would keep silently omitting the
- * `Record` node and its `HAS_METHOD` edges for every unchanged record file
- * (same v7 contract: new nodes/edges the incremental path would otherwise
- * never backfill); force a full re-analyze instead.
- * v11: Rust abstract trait methods (`fn foo(&self) -> T;`, no body) now get a
- * scope + declaration capture (#2604): RUST_SCOPE_QUERY had no
- * `function_signature_item` pattern, so a `&dyn Trait` receiver could never
- * dispatch a CALLS edge to the trait's own method. Same v7/v10 contract: the
- * incremental write set only covers changed files, so a top-up against a
- * pre-v11 index would keep silently missing these CALLS edges for every
- * unchanged Rust trait file; force a full re-analyze instead.
- * v12: Rust range-binding stopped restoring ambiguous duplicate type names
- * (#2514): a function/struct name defined three or more times used to
- * re-resolve to the last-scanned file (a presence toggle), so odd duplicate
- * counts emitted a wrong cross-file CALLS edge. Same v7/v11 contract: the
- * incremental write set only covers changed files, so a top-up against a
- * pre-v12 index would keep these spurious CALLS edges on every unchanged Rust
- * file. v12 also changes edges in the other direction: range-binding now
- * RESOLVES import-disambiguated duplicate names (`for item in make()` /
- * `let Struct { f } = ..` where a `use` or `use x::*` import pins one of several
- * same-named definitions) to the imported definition's type. Both the removed
- * spurious edges and these new resolved edges are cross-file, so a pre-v12
- * top-up would leave unchanged Rust files stale either way; force a full
- * re-analyze instead.
- * v13: Java local classes, enums, records, and interfaces use
- * source-type-relative JLS 13.1 identities (`Outer$1Local`). Number allocation
- * matches javac: one sequence per (enclosing type, local simple name), with a
- * separate sequence for anonymous types. Existing type/member ids, lexical
- * bindings, and ownership edges must not be mixed with newly named unchanged
- * Java files; force a full re-analyze.
- * v14: C# and Kotlin free-call fallback now rejects same-file methods whose
- * instance owner is outside the caller's enclosing class/MRO (#2563). The
- * incremental write set would otherwise retain those stale CALLS edges on
- * every unchanged C# and Kotlin file; force a full re-analyze instead.
- */
-export const INCREMENTAL_SCHEMA_VERSION = 14;
 
 export interface IndexedRepo {
   repoPath: string;
@@ -504,22 +164,9 @@ export interface RegistryEntry {
   branches?: BranchSummary[];
 }
 
-const GITNEXUS_DIR = '.gitnexus';
 const GITNEXUS_EXCLUDE_ENTRY = `${GITNEXUS_DIR}/`;
-export const INDEX_METADATA_FILE = 'gitnexus.json';
-// Dual-written mirror of INDEX_METADATA_FILE, kept for backward compatibility
-// with consumers that only know the pre-rename filename (see MIGRATION.md).
-const LEGACY_METADATA_FILE = 'meta.json';
 
 // ─── Local Storage Helpers ─────────────────────────────────────────────
-
-/**
- * Get the .gitnexus storage path for a repository.
- * Used for local metadata and caches that are not committed.
- */
-export const getStoragePath = (repoPath: string): string => {
-  return path.join(path.resolve(repoPath), GITNEXUS_DIR);
-};
 
 /**
  * Get paths to key storage files.
@@ -605,63 +252,6 @@ export const cleanupOldKuzuFiles = async (
 };
 
 /**
- * Load metadata from the legacy `meta.json` mirror in the given directory.
- * Returns null when the file is absent, unreadable, or unparseable — a
- * corrupt legacy file is treated the same as a missing one (safe rebuild).
- */
-const loadMetaLegacy = async (metaDir: string): Promise<RepoMeta | null> =>
-  tryReadMetaFile(metaDir, LEGACY_METADATA_FILE);
-
-/**
- * Load metadata from a directory containing the metadata file (gitnexus.json).
- * For primary/flat: metaDir = <repo>/.gitnexus
- * For feature branches: metaDir = <repo>/.gitnexus/branches/<slug>
- *
- * Falls back to the legacy `meta.json` mirror ONLY when `gitnexus.json` is
- * provably absent (ENOENT/ENOTDIR). Any other failure — a parse error, EACCES,
- * EIO — returns null instead of silently resurrecting possibly-stale legacy
- * content: a corrupt primary file must trigger the same safe full-rebuild path
- * a missing index would (the fail-safe `saveMeta`'s docstring relies on), not
- * an incremental run over a stale legacy baseline.
- */
-export const loadMeta = async (metaDir: string): Promise<RepoMeta | null> => {
-  let raw: string;
-  try {
-    raw = await fs.readFile(path.join(metaDir, INDEX_METADATA_FILE), 'utf-8');
-  } catch (err) {
-    // Provably absent → the legacy mirror is the source of truth (pre-rename
-    // repo, or a mirror-only state). Anything else → fail safe with null.
-    return isMissingFilesystemError(err) ? loadMetaLegacy(metaDir) : null;
-  }
-  try {
-    return JSON.parse(raw) as RepoMeta;
-  } catch {
-    // Corrupt primary file — do NOT mask it with legacy content.
-    return null;
-  }
-};
-
-/**
- * Atomically write `meta` to `<dir>/<filename>`. Tmp name includes a random
- * suffix (not a fixed `.tmp`) so two concurrent writers targeting the same
- * directory never collide on the same tmp path — mirrors the pattern in
- * core/group/bridge-db.ts's `writeBridgeMeta` (`'wx'` + `0o600` closes the
- * symlink-race/permissions holes CodeQL flags as `js/insecure-temporary-file`;
- * `retryRename` absorbs a transient EBUSY/EPERM/EACCES on the rename itself).
- */
-async function writeMetaFile(dir: string, filename: string, meta: RepoMeta): Promise<void> {
-  const targetPath = path.join(dir, filename);
-  const tmpPath = `${targetPath}.tmp.${randomBytes(8).toString('hex')}`;
-  const handle = await fs.open(tmpPath, 'wx', 0o600);
-  try {
-    await handle.writeFile(JSON.stringify(meta, null, 2), 'utf-8');
-  } finally {
-    await handle.close();
-  }
-  await retryRename(tmpPath, targetPath);
-}
-
-/**
  * Save metadata to the metadata file (gitnexus.json) in the given directory,
  * dual-writing the legacy `meta.json` mirror for backward compatibility.
  *
@@ -681,9 +271,12 @@ async function writeMetaFile(dir: string, filename: string, meta: RepoMeta): Pro
  */
 export const saveMeta = async (metaDir: string, meta: RepoMeta): Promise<void> => {
   await fs.mkdir(metaDir, { recursive: true });
-  await writeMetaFile(metaDir, INDEX_METADATA_FILE, meta);
+  // Serialised once: `meta` carries a fileHashes entry per file, so on a large
+  // repo this string is megabytes and both writes want the identical bytes.
+  const json = JSON.stringify(meta, null, 2);
+  await writeFileAtomic(path.join(metaDir, INDEX_METADATA_FILE), json);
   try {
-    await writeMetaFile(metaDir, LEGACY_METADATA_FILE, meta);
+    await writeFileAtomic(path.join(metaDir, LEGACY_METADATA_FILE), json);
   } catch (err) {
     logger.warn({ err, metaDir }, 'Failed to write legacy meta.json mirror (non-critical)');
   }
@@ -722,19 +315,6 @@ export const loadRepo = async (repoPath: string): Promise<IndexedRepo | null> =>
     ...paths,
     meta,
   };
-};
-
-/**
- * Best-effort read of one specific metadata filename — no fallback, null on
- * any failure (absent, unreadable, or unparseable).
- */
-const tryReadMetaFile = async (dir: string, filename: string): Promise<RepoMeta | null> => {
-  try {
-    const raw = await fs.readFile(path.join(dir, filename), 'utf-8');
-    return JSON.parse(raw) as RepoMeta;
-  } catch {
-    return null;
-  }
 };
 
 /** `indexedAt` as epoch millis; 0 when absent/unparseable (i.e. oldest). */
@@ -859,17 +439,6 @@ export function isReadOnlyFilesystemError(err: unknown): boolean {
 }
 
 /**
- * True for errors that prove a path is absent (ENOENT/ENOTDIR) — as opposed
- * to transient/permission failures (EIO/EACCES/EBUSY…) where the file may
- * well still exist. Exported for consumers that need the same "provably
- * missing vs not provably absent" distinction (e.g. collectBranchCacheKeys).
- */
-export function isMissingFilesystemError(err: unknown): boolean {
-  const code = (err as NodeJS.ErrnoException)?.code;
-  return code === 'ENOENT' || code === 'ENOTDIR';
-}
-
-/**
  * Keep .gitnexus/ ignored. It contains local index state and caches.
  */
 export const ensureGitNexusIgnored = async (repoPath: string): Promise<void> => {
@@ -963,31 +532,121 @@ export const getGlobalRegistryPath = (): string => {
 };
 
 /**
+ * Lock namespace for the global registry.
+ *
+ * Deliberately a dedicated sub-directory rather than {@link getGlobalDir}
+ * itself: an index slot's lock dir is always `<repo>/.gitnexus` (or
+ * `<repo>/.gitnexus/branches/<slug>`), so for a repository rooted at the
+ * user's home directory — dotfiles-at-`$HOME` is a real layout — the per-repo
+ * analyze lock and the global-dir lock would resolve to the SAME directory.
+ * `acquireIndexLock` is not reentrant, so `runFullAnalysis` (which holds the
+ * per-repo lock across its whole pipeline) would then self-deadlock the moment
+ * it reached `registerRepo`/`adoptFlatBranchLabel`. No repo's index slot can
+ * ever be named `registry-lock`, so this namespace cannot collide.
+ */
+const getRegistryLockDir = (): string => path.join(getGlobalDir(), 'registry-lock');
+
+/**
+ * Wait ceiling for the registry lock. A registry transaction is a sub-second
+ * JSON read/merge/write, so it must NOT inherit the index lock's 10-minute
+ * default (sized for multi-minute analyze runs): `gitnexus augment` runs on
+ * every editor/agent tool call with a documented sub-500ms cold-start budget
+ * and reaches this lock via `listRegisteredRepos({ validate: true })`.
+ */
+const REGISTRY_LOCK_TIMEOUT_MS = 5_000;
+
+/**
+ * Serialize global registry read/merge/write transactions across processes.
+ *
+ * The registry is shared by every indexed repository, so per-index locks do
+ * not protect this file. Reuse the cross-platform index lock primitive with a
+ * registry-private lock namespace; the handle is kernel-owned on supported
+ * platforms and crash-reclaimable by the existing fallback.
+ *
+ * On timeout the transaction proceeds UNLOCKED rather than throwing: the lock
+ * closes a lost-update race that existed unguarded before #2716, so degrading
+ * to the old best-effort behaviour is strictly better than failing an
+ * `analyze`/`list`/`augment` outright on a wedged lock (a stale pid-reuse
+ * ghost on platforms without start-time verification can look live forever).
+ */
+const withRegistryLock = async <T>(operation: () => Promise<T>): Promise<T> => {
+  let lock: IndexLockHandle | null = null;
+  try {
+    lock = await acquireIndexLock(getRegistryLockDir(), {
+      timeoutMs: REGISTRY_LOCK_TIMEOUT_MS,
+      // Registry contention was previously invisible: `acquireIndexLock`'s own
+      // `log` texts name an "analyze" holder, which misattributes a registry
+      // wait, so surface a registry-specific line instead (#2716 review).
+      onWaitStart: () =>
+        logger.info('Waiting for another GitNexus process to finish a registry update…'),
+    });
+  } catch (err) {
+    if (!(err instanceof IndexLockTimeoutError)) throw err;
+    logger.warn(
+      { timeoutMs: REGISTRY_LOCK_TIMEOUT_MS },
+      'Timed out waiting for the global registry lock; proceeding without it. A concurrent registry write may be lost.',
+    );
+  }
+  try {
+    return await operation();
+  } finally {
+    lock?.release();
+  }
+};
+
+/**
+ * Drop credentials from every entry's `remoteUrl` (#2914).
+ *
+ * Applied on BOTH registry edges. Capture-time stripping in `getRemoteUrl`
+ * only covers values this version writes; a `registry.json` (or a per-repo
+ * meta that a re-register copies forward) written by an older version still
+ * holds the credential. Reading through here keeps it out of every consumer —
+ * `listRegisteredRepos`, MCP `list_repos`, `gitnexus list`, group sync — and
+ * writing through here means the next registry write drops it at rest instead
+ * of round-tripping it back to disk.
+ *
+ * Sanitised values compare equal to a freshly captured `getRemoteUrl`, so
+ * sibling-clone matching (#2054) is unaffected: both sides lose the same span.
+ */
+const sanitizeEntries = (entries: RegistryEntry[]): RegistryEntry[] =>
+  entries.map((e) => {
+    if (!e.remoteUrl) return e;
+    const cleaned = stripUrlCredentials(e.remoteUrl);
+    return cleaned === e.remoteUrl ? e : { ...e, remoteUrl: cleaned };
+  });
+
+/**
  * Read the global registry. Returns empty array if not found.
  */
 export const readRegistry = async (): Promise<RegistryEntry[]> => {
   try {
     const raw = await fs.readFile(getGlobalRegistryPath(), 'utf-8');
     const data = JSON.parse(raw);
-    return Array.isArray(data) ? data : [];
+    return Array.isArray(data) ? sanitizeEntries(data) : [];
   } catch {
     return [];
   }
 };
 
 /**
- * Write the global registry to disk
+ * Write the global registry to disk.
+ *
+ * Atomic tmp+rename: a crash mid-write can never leave a truncated
+ * registry.json that the next load would treat as empty and silently drop
+ * every registered repo (#2106 R9). The tmp path must stay per-write — the
+ * registry is the one file every gitnexus process on the machine writes, and
+ * `withRegistryLock` degrades to unlocked on timeout, so the write cannot rely
+ * on the lock to keep two writers off one staging path (#2888).
+ *
+ * `attempts` is forwarded to the rename retry; best-effort callers pass `1`.
  */
-const writeRegistry = async (entries: RegistryEntry[]): Promise<void> => {
-  const dir = getGlobalDir();
-  await fs.mkdir(dir, { recursive: true });
-  // Atomic tmp+rename (mirrors saveMeta): a crash mid-write can never leave a
-  // truncated/half-written registry.json that the next load would treat as
-  // empty and silently drop every registered repo (#2106 R9).
-  const target = getGlobalRegistryPath();
-  const tmp = `${target}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(entries, null, 2), 'utf-8');
-  await fs.rename(tmp, target);
+const writeRegistry = async (entries: RegistryEntry[], attempts?: number): Promise<void> => {
+  await fs.mkdir(getGlobalDir(), { recursive: true });
+  await writeFileAtomic(
+    getGlobalRegistryPath(),
+    JSON.stringify(sanitizeEntries(entries), null, 2),
+    attempts,
+  );
 };
 
 /**
@@ -1108,7 +767,7 @@ const hasCustomAlias = (entry: RegistryEntry, inferredName: string | null): bool
  * caller can re-use it to keep AGENTS.md / skill files aligned with the
  * MCP-visible repo name (#979).
  */
-export const registerRepo = async (
+const registerRepoUnlocked = async (
   repoPath: string,
   meta: RepoMeta,
   opts?: RegisterRepoOptions,
@@ -1275,11 +934,17 @@ export const registerRepo = async (
   return name;
 };
 
+export const registerRepo = async (
+  repoPath: string,
+  meta: RepoMeta,
+  opts?: RegisterRepoOptions,
+): Promise<string> => withRegistryLock(() => registerRepoUnlocked(repoPath, meta, opts));
+
 /**
  * Remove a repo from the global registry.
  * Called after `gitnexus clean`.
  */
-export const unregisterRepo = async (repoPath: string): Promise<void> => {
+const unregisterRepoUnlocked = async (repoPath: string): Promise<void> => {
   // Canonicalise BOTH sides so an unregister call issued with the
   // symlink form (`/var/folders/.../repo`) still matches an entry
   // written with the realpath form (`/private/var/folders/.../repo`),
@@ -1291,6 +956,9 @@ export const unregisterRepo = async (repoPath: string): Promise<void> => {
   await writeRegistry(filtered);
 };
 
+export const unregisterRepo = async (repoPath: string): Promise<void> =>
+  withRegistryLock(() => unregisterRepoUnlocked(repoPath));
+
 /**
  * Remove a single non-primary branch's summary from a repo's registry entry
  * (#2106 R7). Called by `gitnexus clean --branch`. Returns `true` when a
@@ -1299,7 +967,7 @@ export const unregisterRepo = async (repoPath: string): Promise<void> => {
  * primary entry is left intact; an empty `branches[]` is dropped to keep the
  * registry shape legacy-clean.
  */
-export const removeBranchIndex = async (repoPath: string, branch: string): Promise<boolean> => {
+const removeBranchIndexUnlocked = async (repoPath: string, branch: string): Promise<boolean> => {
   const resolved = canonicalizePath(repoPath);
   const entries = await readRegistry();
   const idx = entries.findIndex((e) => registryPathEquals(canonicalizePath(e.path), resolved));
@@ -1315,6 +983,9 @@ export const removeBranchIndex = async (repoPath: string, branch: string): Promi
   await writeRegistry(entries);
   return true;
 };
+
+export const removeBranchIndex = async (repoPath: string, branch: string): Promise<boolean> =>
+  withRegistryLock(() => removeBranchIndexUnlocked(repoPath, branch));
 
 /**
  * Record that the flat workspace slot now serves `branch` (#2354).
@@ -1332,6 +1003,12 @@ export const removeBranchIndex = async (repoPath: string, branch: string): Promi
  * a no-op — including the sub-index deletion, which only runs for registered
  * repos (never self-heals an unregistered repo, per #2264/#1169; the registry
  * check precedes the rm per #2364 review F2) — and no subprocess is spawned.
+ *
+ * Only the closing re-read/mutate/write runs under the registry lock. The
+ * recursive `rm` stays outside it — mirroring `clean.ts`, which deletes the
+ * branch directory before calling the (locked) `removeBranchIndex` — so a slow
+ * delete (large sub-index, AV scan, network mount) never blocks every other
+ * registry operation on the machine.
  */
 export const adoptFlatBranchLabel = async (repoPath: string, branch: string): Promise<void> => {
   const canonicalInput = canonicalizePath(repoPath);
@@ -1382,22 +1059,24 @@ export const adoptFlatBranchLabel = async (repoPath: string, branch: string): Pr
     }
   }
 
-  // Re-read AFTER the potentially slow recursive rm: the registry is a
-  // multi-writer whole-file overwrite, and writing a pre-rm snapshot would
-  // silently clobber concurrent registerRepo/removeBranchIndex writers —
-  // the #2106 R9 re-read-before-write discipline registerRepo follows.
-  const entries = await readRegistry();
-  const idx = isRegistered(entries);
-  if (idx < 0) return; // unregistered concurrently → still a no-op
-  const entry = entries[idx];
-  const remaining = dirGone ? entry.branches?.filter((b) => b.branch !== branch) : entry.branches;
-  const droppedSummary = (entry.branches?.length ?? 0) !== (remaining?.length ?? 0);
-  if (entry.branch === branch && !droppedSummary) return; // already coherent
-  entry.branch = branch;
-  if (remaining && remaining.length > 0) entry.branches = remaining;
-  else delete entry.branches;
-  entries[idx] = entry;
-  await writeRegistry(entries);
+  // Re-read AFTER the potentially slow recursive rm, and under the lock: the
+  // registry is a multi-writer whole-file overwrite, and writing a pre-rm
+  // snapshot would silently clobber concurrent registerRepo/removeBranchIndex
+  // writers — the #2106 R9 re-read-before-write discipline registerRepo follows.
+  await withRegistryLock(async () => {
+    const entries = await readRegistry();
+    const idx = isRegistered(entries);
+    if (idx < 0) return; // unregistered concurrently → still a no-op
+    const entry = entries[idx];
+    const remaining = dirGone ? entry.branches?.filter((b) => b.branch !== branch) : entry.branches;
+    const droppedSummary = (entry.branches?.length ?? 0) !== (remaining?.length ?? 0);
+    if (entry.branch === branch && !droppedSummary) return; // already coherent
+    entry.branch = branch;
+    if (remaining && remaining.length > 0) entry.branches = remaining;
+    else delete entry.branches;
+    entries[idx] = entry;
+    await writeRegistry(entries);
+  });
 };
 
 /**
@@ -1675,7 +1354,8 @@ export const resolveRegistryEntry = (entries: RegistryEntry[], target: string): 
  *
  * With `validate: true`, prunes only entries whose metadata is *provably* gone
  * (fs.access on both gitnexus.json and legacy meta.json fails with ENOENT or
- * ENOTDIR) and persists the result. Entries that are merely "not provably
+ * ENOTDIR) and persists the result on a best-effort basis: the pruned view is
+ * always returned, even when the write fails. Entries that are merely "not provably
  * absent" — any other fs.access failure (EIO/EAGAIN/EBUSY/EACCES, etc.) — are
  * KEPT, so a transient I/O storm cannot wipe the registry. A kept entry is
  * therefore "not confirmed present," not "confirmed present"; downstream DB
@@ -1731,9 +1411,37 @@ export const listRegisteredRepos = async (opts?: {
     }
   }
 
-  // If we pruned any entries, save the cleaned registry
+  // If we pruned any entries, save the cleaned registry — under the lock, and
+  // only then. The validation walk above is read-only (an fs.access per entry,
+  // slow on a network mount or a large registry) and the common case prunes
+  // nothing, so holding the global lock across it would serialize every
+  // `gitnexus augment` behind unrelated registry work for no benefit. Re-read
+  // inside the lock and drop the provably-absent paths from that fresh
+  // snapshot, so a concurrent registration in the validation window survives.
   if (valid.length !== entries.length) {
-    await writeRegistry(valid);
+    const pruned = new Set(
+      entries.filter((entry) => !valid.includes(entry)).map((entry) => entry.path),
+    );
+    try {
+      await withRegistryLock(async () => {
+        const fresh = await readRegistry();
+        // attempts: 1 — the catch below discards a failure, so the rename
+        // backoff would only make every other process wait out this lock.
+        await writeRegistry(
+          fresh.filter((entry) => !pruned.has(entry.path)),
+          1,
+        );
+      });
+    } catch (err) {
+      // Best-effort housekeeping: callers consume the returned view, and the
+      // prune set is recomputed on the next validating read. It must not throw
+      // — this runs on MCP startup (LocalBackend.init → refreshRepos), where
+      // nothing catches and a rejection reads as "Server disconnected".
+      logger.warn(
+        { err, prunedCount: pruned.size },
+        'Could not persist the pruned global registry; continuing with the in-memory pruned view.',
+      );
+    }
   }
 
   return valid;
@@ -1753,7 +1461,8 @@ export interface CLIConfig {
     | 'cursor'
     | 'claude'
     | 'codex'
-    | 'opencode';
+    | 'opencode'
+    | 'minimax';
   cursorModel?: string;
   claudeModel?: string;
   codexModel?: string;

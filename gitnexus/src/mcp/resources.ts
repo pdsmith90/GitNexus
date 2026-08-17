@@ -375,7 +375,10 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
   lines.push('  - cypher: Raw graph queries');
   lines.push('  - list_repos: Discover all indexed repositories');
   lines.push('');
-  lines.push('re_index: Run `npx gitnexus analyze` in terminal if data is stale');
+  lines.push(
+    're_index: Run `npx gitnexus analyze --index-only` in terminal if data is stale ' +
+      '(drop --index-only to also refresh AGENTS.md/CLAUDE.md and skills)',
+  );
   lines.push('');
   lines.push('resources_available:');
   lines.push('  - gitnexus://repos: All indexed repositories');
@@ -497,7 +500,7 @@ relationships:
   - IMPORTS: Module imports
   - EXTENDS: Class inheritance
   - IMPLEMENTS: Interface implementation
-  - HAS_METHOD: Class/Struct/Interface owns a Method
+  - HAS_METHOD: Class/Struct/Interface owns a Method; also a Function acting as a pre-ES6 constructor (prototype assignment)
   - HAS_PROPERTY: Class/Struct/Interface owns a Property (field)
   - ACCESSES: Function/Method reads or writes a Property (reason: 'read' or 'write')
   - METHOD_OVERRIDES: Method overrides another Method (MRO)

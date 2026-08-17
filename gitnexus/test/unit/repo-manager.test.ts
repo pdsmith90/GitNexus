@@ -23,11 +23,13 @@ import {
   readRegistry,
   loadCLIConfig,
   registerRepo,
+  unregisterRepo,
   removeBranchIndex,
   adoptFlatBranchLabel,
   listRegisteredRepos,
   resolveRegistryEntry,
   canonicalizePath,
+  registryPathEquals,
   cloneDirBelongsToEntry,
   assertSafeStoragePath,
   RegistryNameCollisionError,
@@ -37,6 +39,7 @@ import {
   type RegistryEntry,
   type RepoMeta,
 } from '../../src/storage/repo-manager.js';
+import { acquireIndexLock } from '../../src/storage/index-lock.js';
 import { parseRepoNameFromUrl, getInferredRepoName } from '../../src/storage/git.js';
 import { execSync } from 'child_process';
 import { createTempDir } from '../helpers/test-db.js';
@@ -710,6 +713,48 @@ describe('case-insensitive path comparison', () => {
   });
 });
 
+// ─── Windows \\?\ extended-length prefix (#2667) ──────────────────────
+//
+// `canonicalizePath` is the single comparison key for the registry, MCP repo
+// resolution and the server repo routes, and `registryPathEquals` compares its
+// output as a plain string. A caller-supplied `\\?\` prefix therefore matched
+// nothing: `path.resolve` preserves the prefix, and the `catch` fallback returns
+// that resolved path untouched.
+//
+// These run only on windows-latest (the file is registered in
+// scripts/cross-platform-tests.ts): `\\?\` is a Win32 concept, and on POSIX the
+// same string is just an oddly-named relative file.
+describe('canonicalizePath vs the \\\\?\\ long-path prefix (#2667)', () => {
+  const isWindows = process.platform === 'win32';
+
+  // Realpath branch. libuv's fs__realpath_handle strips the prefix itself, so
+  // this documents the branch that was already safe.
+  it.skipIf(!isWindows)('drops the prefix for a path that exists on disk', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-longpath-'));
+    try {
+      const prefixed = canonicalizePath(`\\\\?\\${dir}`);
+
+      expect(prefixed.startsWith('\\\\?\\')).toBe(false);
+      expect(registryPathEquals(prefixed, canonicalizePath(dir))).toBe(true);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Catch fallback — the branch that actually leaked. `realpathSync.native`
+  // throws for a path that is not on disk (a registry entry rm'd externally, a
+  // `remove`/`clean` alias, an MCP `repo` argument for an unindexed path), so
+  // the resolved string is returned as-is and carried the prefix straight into
+  // the string compare.
+  it.skipIf(!isWindows)('drops the prefix for a path that does not exist', () => {
+    const missing = path.join(os.tmpdir(), 'gn-longpath-absent-2667', 'repo');
+    const prefixed = canonicalizePath(`\\\\?\\${missing}`);
+
+    expect(prefixed.startsWith('\\\\?\\')).toBe(false);
+    expect(registryPathEquals(prefixed, canonicalizePath(missing))).toBe(true);
+  });
+});
+
 // ─── API key file permissions (hardening #29) ────────────────────────
 
 describe('API key file permissions', () => {
@@ -858,9 +903,183 @@ describe('registerRepo name override + collision guard (#829)', () => {
       await parentB.cleanup();
     }
   });
+  it('preserves all entries when distinct registrations overlap', async () => {
+    const repos = await Promise.all(
+      Array.from({ length: 6 }, (_, index) => createTempDir(`gitnexus-concurrent-repo-${index}-`)),
+    );
+    try {
+      await Promise.all(
+        repos.map((repo, index) =>
+          registerRepo(repo.dbPath, meta, { name: `concurrent-${index}` }),
+        ),
+      );
+
+      const entries = await listRegisteredRepos();
+      expect(entries).toHaveLength(repos.length);
+      expect(new Set(entries.map((entry) => entry.name))).toEqual(
+        new Set(repos.map((_, index) => `concurrent-${index}`)),
+      );
+    } finally {
+      await Promise.all(repos.map((repo) => repo.cleanup()));
+    }
+  });
+
+  it('keeps an overlapping unregisterRepo and registerRepo from clobbering each other', async () => {
+    await registerRepo(tmpRepoA.dbPath, meta, { name: 'stays' });
+    await registerRepo(tmpRepoB.dbPath, meta, { name: 'goes' });
+    const added = await createTempDir('gitnexus-concurrent-added-');
+
+    try {
+      await Promise.all([
+        unregisterRepo(tmpRepoB.dbPath),
+        registerRepo(added.dbPath, meta, { name: 'added' }),
+      ]);
+
+      const entries = await listRegisteredRepos();
+      expect(new Set(entries.map((entry) => entry.name))).toEqual(new Set(['stays', 'added']));
+    } finally {
+      await added.cleanup();
+    }
+  });
+
+  it('registers while an index lock is held on the global directory (#2716)', async () => {
+    // A repo rooted at the user's home directory makes the per-repo analyze
+    // lock target `~/.gitnexus` — the very directory the registry lock would
+    // take if it shared that namespace. `runFullAnalysis` holds the per-repo
+    // lock across its call to `registerRepo` and `acquireIndexLock` is not
+    // reentrant, so a shared namespace self-deadlocks until the wait ceiling
+    // and then degrades. The registry lock lives in its own sub-directory, so
+    // the registration must contend with nothing: no wait announcement, no
+    // degraded-write warning. Asserted on the log rather than elapsed time —
+    // the outcome is what matters, and it stays deterministic on a slow runner.
+    const capture = _captureLogger();
+    const held = await acquireIndexLock(tmpHome.dbPath);
+    try {
+      await registerRepo(tmpRepoA.dbPath, meta, { name: 'home-rooted' });
+    } finally {
+      held.release();
+      capture.restore();
+    }
+
+    const logged = capture.records().map((record) => record.msg);
+    expect(logged).not.toContain(
+      'Waiting for another GitNexus process to finish a registry update…',
+    );
+    expect(logged).not.toContain(
+      'Timed out waiting for the global registry lock; proceeding without it. A concurrent registry write may be lost.',
+    );
+    const entries = await listRegisteredRepos();
+    expect(entries.map((entry) => entry.name)).toEqual(['home-rooted']);
+  });
 });
 
 // ─── registerRepo branch nesting (#2106) ─────────────────────────────
+
+// ─── remoteUrl credentials (#2914) ───────────────────────────────────
+//
+// The registry is the surface `list_repos` (MCP), `gitnexus list` and group
+// sync read from, so a `remoteUrl` carrying `https://user:token@` turns repo
+// discovery into credential disclosure. Capture-time stripping in
+// `getRemoteUrl` only covers what THIS version writes — a registry.json (or a
+// per-repo meta a re-register copies forward) written by an older version
+// still holds one, so both registry edges sanitize. Fake credential only.
+
+describe('registry never emits or persists remoteUrl credentials (#2914)', () => {
+  const FAKE_TOKEN = 'ExAmPle-FAKE-SECRET';
+  const CREDENTIALED = `https://x-access-token:${FAKE_TOKEN}@github.com/example/project`;
+  const CLEAN = 'https://github.com/example/project';
+
+  let tmpHome: Awaited<ReturnType<typeof createTempDir>>;
+  let tmpRepo: Awaited<ReturnType<typeof createTempDir>>;
+  let savedGitnexusHome: string | undefined;
+  let registryPath: string;
+
+  const meta: RepoMeta = {
+    repoPath: '',
+    lastCommit: 'abc1234',
+    indexedAt: '2026-08-11T12:00:00.000Z',
+    stats: { files: 1, nodes: 1 },
+  };
+
+  beforeEach(async () => {
+    tmpHome = await createTempDir('gitnexus-2914-home-');
+    tmpRepo = await createTempDir('gitnexus-2914-repo-');
+    savedGitnexusHome = process.env.GITNEXUS_HOME;
+    process.env.GITNEXUS_HOME = tmpHome.dbPath;
+    registryPath = path.join(tmpHome.dbPath, 'registry.json');
+  });
+
+  afterEach(async () => {
+    if (savedGitnexusHome === undefined) delete process.env.GITNEXUS_HOME;
+    else process.env.GITNEXUS_HOME = savedGitnexusHome;
+    await tmpHome.cleanup();
+    await tmpRepo.cleanup();
+  });
+
+  /** A registry.json as an older version would have left it. */
+  const seedLegacyRegistry = async (entryPath: string): Promise<void> => {
+    const legacy: RegistryEntry[] = [
+      {
+        name: 'legacy',
+        path: entryPath,
+        storagePath: path.join(entryPath, '.gitnexus'),
+        indexedAt: meta.indexedAt,
+        lastCommit: meta.lastCommit,
+        remoteUrl: CREDENTIALED,
+      },
+    ];
+    await fs.writeFile(registryPath, JSON.stringify(legacy, null, 2), 'utf-8');
+  };
+
+  it('sanitizes a legacy on-disk entry before listRegisteredRepos returns it', async () => {
+    await seedLegacyRegistry(tmpRepo.dbPath);
+
+    const entries = await listRegisteredRepos();
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0].remoteUrl).toBe(CLEAN);
+    expect(JSON.stringify(entries)).not.toContain(FAKE_TOKEN);
+  });
+
+  it('never writes a credentialed remoteUrl to registry.json', async () => {
+    // meta.remoteUrl bypasses getRemoteUrl entirely — this is the legacy
+    // per-repo gitnexus.json being copied forward into a fresh registry.
+    await registerRepo(tmpRepo.dbPath, { ...meta, remoteUrl: CREDENTIALED }, { name: 'repro' });
+
+    const raw = await fs.readFile(registryPath, 'utf-8');
+    expect(raw).not.toContain(FAKE_TOKEN);
+    expect((JSON.parse(raw) as RegistryEntry[])[0].remoteUrl).toBe(CLEAN);
+  });
+
+  it('scrubs an untouched legacy entry when some other repo is registered', async () => {
+    const other = await createTempDir('gitnexus-2914-other-');
+    try {
+      await seedLegacyRegistry(other.dbPath);
+      await registerRepo(tmpRepo.dbPath, meta, { name: 'fresh' });
+
+      const raw = await fs.readFile(registryPath, 'utf-8');
+      expect(raw).not.toContain(FAKE_TOKEN);
+      // The legacy entry survives — it is scrubbed, not dropped.
+      expect(JSON.parse(raw)).toHaveLength(2);
+    } finally {
+      await other.cleanup();
+    }
+  });
+
+  it('still matches sibling clones after sanitization (#2054 fingerprint)', async () => {
+    await registerRepo(tmpRepo.dbPath, { ...meta, remoteUrl: CREDENTIALED }, { name: 'with-cred' });
+    const other = await createTempDir('gitnexus-2914-sibling-');
+    try {
+      await registerRepo(other.dbPath, { ...meta, remoteUrl: CLEAN }, { name: 'clean' });
+
+      const entries = await listRegisteredRepos();
+      const remotes = entries.map((e) => e.remoteUrl);
+      expect(remotes).toEqual([CLEAN, CLEAN]);
+    } finally {
+      await other.cleanup();
+    }
+  });
+});
 
 describe('registerRepo branch nesting (#2106)', () => {
   let tmpHome: Awaited<ReturnType<typeof createTempDir>>;
@@ -970,6 +1189,24 @@ describe('registerRepo branch nesting (#2106)', () => {
     await removeBranchIndex(tmpRepo.dbPath, 'feature/x');
     const [entry] = await listRegisteredRepos();
     expect(entry.branches?.map((b) => b.branch)).toEqual(['feature/y']);
+  });
+
+  it('overlapping removeBranchIndex calls drop both summaries (#2716)', async () => {
+    await registerRepo(tmpRepo.dbPath, metaFor('main', 'aaa1111'));
+    await registerRepo(tmpRepo.dbPath, metaFor('feature/x', 'bbb2222'), { branch: 'feature/x' });
+    await registerRepo(tmpRepo.dbPath, metaFor('feature/y', 'ccc3333'), { branch: 'feature/y' });
+
+    // Unserialized, both writers read the same two-branch snapshot and the
+    // last rename wins — one summary survives as a lost update.
+    const removed = await Promise.all([
+      removeBranchIndex(tmpRepo.dbPath, 'feature/x'),
+      removeBranchIndex(tmpRepo.dbPath, 'feature/y'),
+    ]);
+
+    expect(removed).toEqual([true, true]);
+    const [entry] = await listRegisteredRepos();
+    expect(entry.branch).toBe('main'); // primary intact
+    expect(entry.branches).toBeUndefined();
   });
 
   // ─── adoptFlatBranchLabel (#2354) ───────────────────────────────────

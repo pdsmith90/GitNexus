@@ -1,5 +1,6 @@
 import type { Capture, CaptureMatch } from 'gitnexus-shared';
 import {
+  findChild,
   nodeIfType,
   nodeToCapture,
   syntheticCapture,
@@ -13,6 +14,7 @@ import { synthesizeRustReceiverBinding } from './receiver-binding.js';
 import { getTreeSitterBufferSize } from '../../constants.js';
 import { parseSourceSafe } from '../../../tree-sitter/safe-parse.js';
 import { synthesizeCallableFlowCaptures } from '../../utils/callable-flow-captures.js';
+import { synthesizeReceiverChainCapture } from '../../utils/receiver-chain-captures.js';
 
 const RUST_CALLABLE_CAPTURE_OPTIONS = {
   functionNodeTypes: new Set(['function_item', 'closure_expression']),
@@ -123,6 +125,31 @@ export function emitRustScopeCaptures(
       }
     }
 
+    // `Self` in a type binding names the enclosing impl's type, not a type
+    // called "Self". `let fresh = Self { … }` inside `impl User` binds
+    // `fresh: User`; recorded verbatim it binds `fresh: Self`, which resolves
+    // to nothing and leaves the receiver's type unknown.
+    //
+    // The type-env channel already substitutes this
+    // (`type-extractors/rust.ts` → `findEnclosingImplType`); the
+    // scope-resolution channel did not, so the two disagreed. That went
+    // unnoticed while `lookupCore` Step 1 still walked the lexical chain for
+    // named receivers — the impl scope binds the method by name, so
+    // `fresh.validate()` resolved by accident. #2714 stopped that walk for
+    // named receivers and the gap became a lost edge (#2699 follow-up).
+    const tbTypeNode = nodeMap['@type-binding.type'];
+    if (grouped['@type-binding.type']?.text === 'Self' && tbTypeNode !== undefined) {
+      const implNode = findEnclosingImpl(tbTypeNode);
+      const implTypeNode = implNode?.childForFieldName('type') ?? null;
+      if (implTypeNode !== null) {
+        grouped['@type-binding.type'] = syntheticCapture(
+          '@type-binding.type',
+          tbTypeNode,
+          implTypeNode.text,
+        );
+      }
+    }
+
     // Hoist return-type bindings from impl block functions to module level.
     // The auto-hoist in the scope-extractor places a type binding whose
     // anchor matches its innermost scope on the parent scope. By using the
@@ -172,6 +199,12 @@ export function emitRustScopeCaptures(
       }
     }
 
+    // Structural receiver chain for a call whose receiver is itself an
+    // expression, so resolution can type it by folding over structure
+    // instead of re-parsing the receiver's source text. Self-gating: a
+    // non-call match, an absent receiver, or a chain with no nameable base
+    // all leave `grouped` untouched.
+    synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
     out.push(grouped);
   }
 
@@ -220,10 +253,22 @@ function synthesizeRustInheritanceReferences(root: SyntaxNode): CaptureMatch[] {
     const traitName = bareTypeIdentifier(traitField);
     const structName = bareTypeIdentifier(typeField);
     if (traitName === null || structName === null) return;
+    // The trait's generic ARGUMENTS (`impl Validator<String> for V`), so
+    // interface dispatch can tell one instantiation of a trait from another
+    // (#2912). Emitted as a sub-tag rather than by widening the anchor: the
+    // anchor is the bare `type_identifier` inside the `generic_type`, and its
+    // range is part of the inheritance edge's id.
+    const traitArguments =
+      traitField.type === 'generic_type' ? findChild(traitField, 'type_arguments') : null;
     out.push({
       '@reference.inherits': nodeToCapture('@reference.inherits', traitName),
       '@reference.name': nodeToCapture('@reference.name', traitName),
       '@reference.receiver': syntheticCapture('@reference.receiver', structName, structName.text),
+      ...(traitArguments === null
+        ? {}
+        : {
+            '@reference.type-arguments': nodeToCapture('@reference.type-arguments', traitArguments),
+          }),
     });
   });
   return out;
