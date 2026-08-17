@@ -93,6 +93,12 @@ program
   )
   .option('--no-stats', 'Omit volatile file/symbol counts from AGENTS.md and CLAUDE.md')
   .option(
+    '--self-commit',
+    'Auto-commit AGENTS.md/CLAUDE.md changes after analyze (opt-in, off by default). ' +
+      'Scoped to only those two files (never `git add -A`); no-ops if neither exists, ' +
+      'neither changed, or the repo has no git identity configured.',
+  )
+  .option(
     '--skip-skills',
     'Skip installing standard GitNexus skill files directly under .claude/skills/ and .agents/skills/. ' +
       'Does not suppress community skills from --skills (those use .claude/skills/gitnexus-area-*). ' +
@@ -297,9 +303,9 @@ program
   .option('-f, --force', 'Force full regeneration even if up to date')
   .option(
     '--provider <provider>',
-    'LLM provider: openai, openrouter, azure, custom, cursor, claude, codex, or opencode (default: openai)',
+    'LLM provider: minimax, openai, openrouter, azure, custom, cursor, claude, codex, or opencode (default: minimax)',
   )
-  .option('--model <model>', 'LLM model or Azure deployment name (default: minimax/minimax-m2.5)')
+  .option('--model <model>', 'LLM model or deployment name (default: MiniMax-M3)')
   .option(
     '--base-url <url>',
     'LLM API base URL. Azure v1: https://{resource}.openai.azure.com/openai/v1',
@@ -309,11 +315,8 @@ program
     '--api-version <version>',
     'Azure api-version query param, e.g. 2024-10-21 (legacy Azure API only)',
   )
-  .option(
-    '--reasoning-model',
-    'Mark deployment as reasoning model (o1/o3/o4-mini) — strips temperature, uses max_completion_tokens',
-  )
-  .option('--no-reasoning-model', 'Disable reasoning model mode (overrides saved config)')
+  .option('--reasoning-model', 'Enable reasoning mode; MiniMax-M3 uses adaptive thinking')
+  .option('--no-reasoning-model', 'Disable reasoning mode; MiniMax-M3 disables thinking')
   .option('--concurrency <n>', 'Parallel LLM calls (default: 3)', '3')
   .option('--timeout <seconds>', 'LLM request timeout in seconds (default: disabled)')
   .option('--retries <n>', 'Max LLM retry attempts per request (default: 3)')
@@ -408,6 +411,7 @@ program
   .command('trace <from> <to>')
   .description('Find the shortest directed path between two symbols (call + class-member edges)')
   .option('--from-uid <uid>', 'Source symbol UID (zero-ambiguity)')
+  .option('-f, --file <path>', 'Source file path hint (alias for --from-file)')
   .option('--from-file <path>', 'Source file path hint')
   .option('--to-uid <uid>', 'Target symbol UID (zero-ambiguity)')
   .option('--to-file <path>', 'Target file path hint')

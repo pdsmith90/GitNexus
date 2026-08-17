@@ -6,6 +6,7 @@ import type { ContractExtractor, CypherExecutor } from '../contract-extractor.js
 import type { ExtractedContract, RepoHandle } from '../types.js';
 import { readSafe } from './fs-utils.js';
 import { parseSourceSafe } from '../../tree-sitter/safe-parse.js';
+import { toZeroBasedLine } from '../../ingestion/utils/line-base.js';
 import { logger } from '../../logger.js';
 import {
   getPluginForFile,
@@ -102,6 +103,10 @@ RETURN sym.id AS uid, sym.name AS name, sym.filePath AS filePath,
 // degenerate edge-less node NOR inflates the uniqueness count and masks the real
 // handler. `LIMIT 2` bounds materialization: distinguishing unique (1) from
 // ambiguous (>=2) never needs more than two rows (the count guard stays exact).
+//
+// determinism: probe — uniqueness discriminator, not a window. `toResolvedSymbol`
+// reads row 0 only when `rows.length === 1`; a 2-row result is discarded whole,
+// so WHICH two rows came back can never reach a caller.
 export const RESOLVE_BY_NAME_QUERY = `
 MATCH (n) WHERE labels(n) IN ['Function','Method','CodeElement']
   AND n.name = $name AND n.filePath <> ''
@@ -114,6 +119,10 @@ LIMIT 2`;
 // the precise rung — it survives aliases and local same-name collisions that a
 // repo-wide name lookup cannot, and only resolves on a unique match within that
 // module. `LIMIT 2` keeps the uniqueness count exact (see RESOLVE_BY_NAME_QUERY).
+//
+// determinism: probe — uniqueness discriminator, not a window. Same consumer as
+// RESOLVE_BY_NAME_QUERY: `toResolvedSymbol` reads row 0 only when exactly one row
+// came back, and discards a 2-row result whole.
 export const RESOLVE_IN_MODULE_QUERY = `
 MATCH (n) WHERE labels(n) IN ['Function','Method','CodeElement']
   AND n.name = $name AND (n.filePath STARTS WITH $fileDot OR n.filePath STARTS WITH $fileSlash)
@@ -171,13 +180,17 @@ function resolveContainingSymbol(
   line: number,
 ): ResolvedSymbol | null {
   const norm = (x: unknown): string => String(x ?? '');
-  // Detection lines are 1-based; symbol spans are stored 0-based for the
-  // languages indexed today (parse-worker records `startPosition.row`). So the
-  // base-correct probe is `line - 1`. Pick the INNERMOST (smallest-span) symbol
-  // whose span contains the probe. Only if nothing contains `line - 1` do we
-  // retry with the raw `line` — a defensive fallback for any future language
-  // that stores 1-based spans. Probing `line - 1` first (rather than OR-ing both)
-  // avoids the +1 slack mis-picking a one-line sibling that sits on `line`.
+  // Detection lines are 1-based (`HttpDetection.line`); symbol spans are stored
+  // 0-based for the languages indexed today (parse-worker records
+  // `startPosition.row`). So the base-correct probe is `toZeroBasedLine(line)` —
+  // the same named 1-based→graph-space conversion the ingestion emitters use
+  // (#2377), rather than a bare literal. Pick the INNERMOST (smallest-span)
+  // symbol whose span contains the probe. Only if nothing contains the 0-based
+  // probe do we retry with the raw `line` — a defensive fallback for any future
+  // language that stores 1-based spans. Probing 0-based first (rather than
+  // OR-ing both) avoids the +1 slack mis-picking a one-line sibling that sits on
+  // `line`. The helper's `Math.max(0, …)` clamp is inert here: every plugin sets
+  // `line` from `startPosition.row + 1`, so it is always >= 1.
   const pick = (probe: number): ResolvedSymbol | null => {
     let best: ResolvedSymbol | null = null;
     let bestSpan = Number.POSITIVE_INFINITY;
@@ -200,7 +213,7 @@ function resolveContainingSymbol(
     }
     return best && best.uid ? best : null;
   };
-  return pick(line - 1) ?? pick(line);
+  return pick(toZeroBasedLine(line)) ?? pick(line);
 }
 
 /** A Function/Method in the file matching `name` exactly (for named handlers). */
