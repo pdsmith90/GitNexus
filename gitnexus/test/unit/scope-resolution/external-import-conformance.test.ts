@@ -290,6 +290,22 @@ const CASES: ReadonlyMap<SupportedLanguages, ConformanceCase> = new Map([
     },
   ],
   [
+    SupportedLanguages.Julia,
+    {
+      // `using LinearAlgebra` names a registered package with no workspace
+      // file. `resolveJuliaImportTarget` has no way to know that: its module
+      // branch turns any dotted specifier into `<name>.jl` and suffix-matches
+      // it, so a repo that happens to carry `src/LinearAlgebra.jl` wins the
+      // lookup. Recorded in KNOWN_GAPS rather than asserted as null, because
+      // that is what the resolver actually answers today.
+      files: ['src/LinearAlgebra.jl', 'src/Types.jl', 'src/Main.jl'],
+      fromFile: 'src/Main.jl',
+      resolutionConfig: undefined,
+      external: 'LinearAlgebra',
+      decoy: 'src/LinearAlgebra.jl',
+    },
+  ],
+  [
     SupportedLanguages.PHP,
     {
       files: ['app/Models/User.php', 'lib/Legacy/Missing.php', 'app/Main.php'],
@@ -380,6 +396,7 @@ const KNOWN_GAPS: ReadonlyMap<SupportedLanguages, string> = new Map<SupportedLan
   [SupportedLanguages.C, '`stdio.h` -> `src/stdio.h`'],
   [SupportedLanguages.CPlusPlus, '`cstdio.h` -> `src/cstdio.h`'],
   [SupportedLanguages.Cobol, '`EXTERNAL` -> `vendor/EXTERNAL.cpy`'],
+  [SupportedLanguages.Julia, '`LinearAlgebra` -> `src/LinearAlgebra.jl`'],
 ]);
 
 /**
