@@ -440,6 +440,28 @@ const FIXTURES: ReadonlyMap<SupportedLanguages, ImportTargetFixture> = new Map<
     },
   ],
   [
+    SupportedLanguages.Julia,
+    {
+      // `include("path/to/f.jl")` is the only Julia import form that can reach a
+      // workspace file: `using`/`import` of a registered package (LinearAlgebra,
+      // Dates, ...) has no local file and resolves to nothing by design. The
+      // include strategy runs FIRST in `juliaImportConfig`, so both arms below
+      // enter `suffixResolve` and exercise the shared index rather than the
+      // package leg that would resolve nothing and measure nothing.
+      files: ['src/Types.jl', 'src/util.jl', 'src/Main.jl'],
+      fromFile: 'src/Main.jl',
+      resolutionConfig: undefined,
+      // A `.jl` target with no workspace file: the include leg misses, then
+      // `createStandardStrategy` runs its own cascade to completion — the
+      // expensive path, which is the one the property is about.
+      missTarget: (i) => `ghost${i}/missing.jl`,
+      hitTarget: 'Types.jl',
+      parsedImport: IGNORES_CONTEXT,
+      minimumScans: 1,
+      minimumParsedFileReads: 0,
+    },
+  ],
+  [
     SupportedLanguages.Kotlin,
     {
       files: [
