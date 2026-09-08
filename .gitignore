@@ -128,3 +128,6 @@ gitnexus/web/
 
 # Machine-local skill-evolution evidence (consumed by eval/workflow_bench/evolve.py)
 eval/workflow_bench/learnings.jsonl
+
+# Python virtual environment (local, not tracked)
+.venv/
