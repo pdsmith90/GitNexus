@@ -111,14 +111,14 @@ mirror. `gitnexus/test/unit/shipped-skills-sync.test.ts` guards the copies. Toke
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **GitNexus** (248612 symbols, 565510 relationships, 918 execution flows).
+This project is indexed by GitNexus as **GitNexus** (293478 symbols, 662838 relationships, 790 execution flows).
 
 > Index stale? Run `node .gitnexus/run.cjs analyze --index-only` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? Bootstrap with `npx`, `bunx`, or `pnpm dlx` — e.g. `bunx gitnexus@latest analyze` (npm 11 npx crash; #1939).
 
 ## Always Do
 
 - **MUST run impact analysis before editing.** Use `impact({target: "symbolName", direction: "upstream"})` (MCP) or `node .gitnexus/run.cjs impact "symbolName" --direction upstream --repo .` (CLI fallback); report callers, processes, and risk. Never substitute grep for graph analysis. For unified PDG impact, add `mode: "pdg"` with optional `line: <N>` — it returns statement-level `affectedStatements` over CDG + REACHING_DEF and inter-procedural symbols in `interproceduralByDepth`/`byDepth`; no-layer/degraded PDG results are UNKNOWN-risk notes (`--pdg` layer). CLI equivalent: `node .gitnexus/run.cjs impact "symbolName" --direction upstream --mode pdg --line <N> --repo .`.
-- **MUST analyze graph changes before committing.** Use `detect_changes({scope: "all"})` (MCP) or `node .gitnexus/run.cjs detect-changes --scope all --repo .` (CLI fallback). `partial: true` or `truncated: true` is not a clean check — a zero means unseen, not unaffected; re-run it. For regression review: `detect_changes({scope: "compare", base_ref: "main"})` or `node .gitnexus/run.cjs detect-changes --scope compare --base-ref "main" --repo .`.
+- **MUST analyze graph changes before committing.** Use `detect_changes({scope: "all"})` (MCP) or `node .gitnexus/run.cjs detect-changes --scope all --repo .` (CLI fallback). `partial: true` or `truncated: true` is not a clean check — a zero means unseen, not unaffected; re-run it. For regression review: `detect_changes({scope: "compare", base_ref: "Julia"})` or `node .gitnexus/run.cjs detect-changes --scope compare --base-ref "Julia" --repo .`.
 - **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
 - **MUST treat `risk: UNKNOWN` as unresolved, not as low.** An empty caller set is not evidence the symbol is unused — it can also mean the callers are not resolvable by the index (plain-object property access, dynamic dispatch, cross-language calls). `impact` pairs `UNKNOWN` with a `riskNote` saying so. Confirm with a text search before treating the symbol as safe to change or delete; do not proceed on the strength of a zero.
 - When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
@@ -152,6 +152,26 @@ This project is indexed by GitNexus as **GitNexus** (248612 symbols, 565510 rela
 | Rename / extract / split / refactor | `.claude/skills/gitnexus-refactoring/SKILL.md` |
 | Tools, resources, schema reference | `.claude/skills/gitnexus-guide/SKILL.md` |
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus-cli/SKILL.md` |
+| Work in the Visitors area (839 symbols) | `.claude/skills/gitnexus-area-visitors/SKILL.md` |
+| Work in the Unit area (689 symbols) | `.claude/skills/gitnexus-area-unit/SKILL.md` |
+| Work in the Scripts area (345 symbols) | `.claude/skills/gitnexus-area-scripts/SKILL.md` |
+| Work in the Lbug area (334 symbols) | `.claude/skills/gitnexus-area-lbug/SKILL.md` |
+| Work in the Scope-resolution area (259 symbols) | `.claude/skills/gitnexus-area-scope-resolution/SKILL.md` |
+| Work in the Cpp area (253 symbols) | `.claude/skills/gitnexus-area-cpp/SKILL.md` |
+| Work in the Passes area (250 symbols) | `.claude/skills/gitnexus-area-passes/SKILL.md` |
+| Work in the Integration area (224 symbols) | `.claude/skills/gitnexus-area-integration/SKILL.md` |
+| Work in the Ingestion area (200 symbols) | `.claude/skills/gitnexus-area-ingestion/SKILL.md` |
+| Work in the Tests area (199 symbols) | `.claude/skills/gitnexus-area-tests/SKILL.md` |
+| Work in the Php area (183 symbols) | `.claude/skills/gitnexus-area-php/SKILL.md` |
+| Work in the Group area (180 symbols) | `.claude/skills/gitnexus-area-group/SKILL.md` |
+| Work in the Route-extractors area (169 symbols) | `.claude/skills/gitnexus-area-route-extractors/SKILL.md` |
+| Work in the Cli area (164 symbols) | `.claude/skills/gitnexus-area-cli/SKILL.md` |
+| Work in the Type-extractors area (161 symbols) | `.claude/skills/gitnexus-area-type-extractors/SKILL.md` |
+| Work in the Storage area (159 symbols) | `.claude/skills/gitnexus-area-storage/SKILL.md` |
+| Work in the Configs area (153 symbols) | `.claude/skills/gitnexus-area-configs/SKILL.md` |
+| Work in the Local area (144 symbols) | `.claude/skills/gitnexus-area-local/SKILL.md` |
+| Work in the Workflow_bench area (137 symbols) | `.claude/skills/gitnexus-area-workflow-bench/SKILL.md` |
+| Work in the Embeddings area (125 symbols) | `.claude/skills/gitnexus-area-embeddings/SKILL.md` |
 
 <!-- gitnexus:end -->
 
