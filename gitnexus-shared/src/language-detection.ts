@@ -32,6 +32,7 @@ const EXTENSION_MAP: Record<SupportedLanguages, readonly string[]> = {
   [SupportedLanguages.Python]: ['.py'],
   [SupportedLanguages.Java]: ['.java'],
   [SupportedLanguages.C]: ['.c'],
+  [SupportedLanguages.ObjectiveC]: ['.m', '.mm'],
   [SupportedLanguages.CPlusPlus]: [
     '.cpp',
     '.cc',
@@ -53,6 +54,7 @@ const EXTENSION_MAP: Record<SupportedLanguages, readonly string[]> = {
   [SupportedLanguages.Dart]: ['.dart'],
   [SupportedLanguages.Vue]: ['.vue'],
   [SupportedLanguages.Cobol]: ['.cbl', '.cob', '.cpy', '.cobol'],
+  [SupportedLanguages.Zig]: ['.zig'],
   [SupportedLanguages.Julia]: ['.jl'],
 } satisfies Record<SupportedLanguages, readonly string[]>; // Ensure exhaustiveness
 
@@ -111,6 +113,7 @@ const SYNTAX_MAP: Record<SupportedLanguages, string> = {
   [SupportedLanguages.Python]: 'python',
   [SupportedLanguages.Java]: 'java',
   [SupportedLanguages.C]: 'c',
+  [SupportedLanguages.ObjectiveC]: 'objectivec',
   [SupportedLanguages.CPlusPlus]: 'cpp',
   [SupportedLanguages.CSharp]: 'csharp',
   [SupportedLanguages.Go]: 'go',
@@ -122,6 +125,7 @@ const SYNTAX_MAP: Record<SupportedLanguages, string> = {
   [SupportedLanguages.Dart]: 'dart',
   [SupportedLanguages.Vue]: 'typescript',
   [SupportedLanguages.Cobol]: 'cobol',
+  [SupportedLanguages.Zig]: 'zig',
   [SupportedLanguages.Julia]: 'julia',
 } satisfies Record<SupportedLanguages, string>; // Ensure exhaustiveness
 

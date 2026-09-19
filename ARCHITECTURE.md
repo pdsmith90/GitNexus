@@ -24,7 +24,7 @@ Monorepo: **CLI/MCP** (`gitnexus/`) + **browser UI** (`gitnexus-web/`).
    - **HTTP bridge:** `serve.ts` → Express (`api.ts`, `mcp-http.ts`) for web UI
    - **CLI direct:** `gitnexus query|context|impact|cypher` in `tool.ts`
 
-4. **Staleness** — `staleness.ts` compares indexed `lastCommit` to `HEAD`, surfaces hints.
+4. **Staleness** — `core/git-staleness.ts` compares indexed `lastCommit` to `HEAD` and classifies the result as `current`, `behind`, `diverged` (HEAD moved off the indexed commit, gap uncountable) or `unknown`; `core/staleness-status.ts` builds the one `staleness` payload that MCP `list_repos`, the read tools and the `serve` repo routes all emit.
 
 ## MCP tools
 
@@ -108,7 +108,7 @@ scan → structure → [springConfig, markdown, cobol] → parse → [routes, to
 | `pruneLocalSymbols`       | `prune-local-symbols.ts`               | `scopeResolution`                                                  | Drops inert block-local `Const`/`Variable`/`Static` nodes (only a `File→DEFINES` edge) post-resolution                                                                                      |
 | `mro`                     | `mro.ts`                               | `crossFile`, `scopeResolution`, `pruneLocalSymbols`, `structure`   | METHOD_OVERRIDES + METHOD_IMPLEMENTS edges                                                                                                                                                  |
 | `springAopInheritance`    | `spring-aop.ts`                        | `springAop`, `mro`                                                 | Propagates declarative behavior through class/interface inheritance decisions                                                                                                               |
-| `di`                      | `di.ts`                                | `mro`                                                              | INJECTS edges from consumer Classes or factory Methods to provider Classes/declaration CodeElements (framework-neutral DI resolution; per-language matchers registered in `di-extractors/`) |
+| `di`                      | `di.ts`                                | `mro`                                                              | INJECTS edges from consumer Classes, factory Methods, or AST-captured programmatic lookup callables to provider Classes/declaration CodeElements (framework-neutral DI resolution; per-language matchers registered in `di-extractors/`) |
 | `communities`             | `communities.ts`                       | `mro`, `pruneLocalSymbols`, `structure`                            | Community nodes + MEMBER_OF edges (Leiden algorithm)                                                                                                                                        |
 | `processes`               | `processes.ts`                         | `communities`, `routes`, `tools`, `pruneLocalSymbols`, `structure` | Process nodes + STEP_IN_PROCESS edges                                                                                                                                                       |
 
@@ -174,7 +174,7 @@ converging on the routes phase's `(method, url)` registry:
 | Filesystem convention | path → URL, no parsing | Next.js `app/`, Expo, PHP |
 | Single-file framework route | `isRouteFile` + worker extraction | Laravel `routes/*.php` |
 | Cross-file framework route | `discoverRootRouteFiles` + `extractRoutes` | Django `urlpatterns` |
-| AST-level route in a normal file | `extractDecoratorRoutes` | Spring, FastAPI, NestJS, **JS/TS dispatch guards and static data route tables** |
+| AST-level route in a normal file | `extractDecoratorRoutes` | Spring, FastAPI, NestJS (`@Controller` + `@Get`/`@Post`/…; URLs are controller-relative — `setGlobalPrefix` and URI versioning live in the bootstrap file and are not applied), **JS/TS dispatch guards and static data route tables** |
 
 The last row is the one whose name undersells it. A route is DECLARED by a
 decorator, but it can also be **inferred** from a raw `node:http` server's own
@@ -377,7 +377,7 @@ CI auto-discovers the set via `tsx`. No workflow edit required.
 
 ## Language-agnostic graph feeding
 
-16 languages → single unified graph. Four abstraction layers:
+18 languages → single unified graph. Four abstraction layers:
 
 ```
  Unified Graph Schema (44 node types, 21 relationship types)
@@ -403,8 +403,9 @@ Each language implements `LanguageProvider` (`language-provider.ts`). Key fields
 | `typeConfig`           | Type annotation extraction rules                                                                                                                                                                                                                                                                                                  |
 | `mroStrategy`          | `first-wins` / `c3` / `none`                                                                                                                                                                                                                                                                                                      |
 | `descriptionExtractor` | Optional hook returning a symbol's doc-comment text as its `description`; feeds the embedding metadata header so doc-only terms are semantically searchable (issue #2270). Most languages register `createLeadingDocDescriptionExtractor` (shared, language-neutral; per-language comment/wrapper config passed at the call site) |
+| `definitionPropertiesExtractor` | Optional language-owned hook for structured, clone-safe definition metadata. Shared ingestion persists these properties opaquely; the owning provider supplies the extraction semantics. |
 
-16 providers in `languages/index.ts` via `satisfies Record<SupportedLanguages, LanguageProvider>` — missing a language is a compile error.
+18 providers in `languages/index.ts` via `satisfies Record<SupportedLanguages, LanguageProvider>` — missing a language is a compile error.
 
 ### Unified capture tags
 
@@ -541,4 +542,5 @@ Node IDs use arity suffix (`#<paramCount>`): `Method:file:Class.method#1` vs `#2
 - [RUNBOOK.md](RUNBOOK.md) — operational commands and recovery
 - [GUARDRAILS.md](GUARDRAILS.md) — safety boundaries for humans and agents
 - [TESTING.md](TESTING.md) — how to run tests
+- [docs/languages/objective-c-provider.md](docs/languages/objective-c-provider.md) — Objective-C provider behavior and limits
 - `AGENTS.md` / `CLAUDE.md` — agent workflows and tool usage

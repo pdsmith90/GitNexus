@@ -4,7 +4,9 @@
  * `--check` inventory arm at the foot of this file fails when the two disagree
  * — over ONE shared corpus so the arms are directly comparable. One arm per
  * registered language, plus a second `csharp` arm carrying csproj configs
- * (#2902), so there is one more arm than there are languages.
+ * (#2902), so there is one more arm than there are languages. The newest row
+ * is `zig` (PR #1432), added the day its resolver registered — the inventory
+ * arm below is what noticed it missing, which is the arm doing its job.
  *
  * NO LANGUAGE IS OMITTED, and that is the point of the list rather than an
  * accident of it. Nine of these arms (go, csharp, csharp_csproj, dart, ruby,
@@ -109,6 +111,19 @@
  *     depth-then-lexicographic tie-break, so the collide arm (a `mod{n}` header
  *     in every service's `include/`) is where it grows: 2.54 / 2.64 against
  *     1.06 on file count.
+ *   - zig: `resolveZigImportInternal` is rust's shape — an `@import("…zig")`
+ *     path is walked component by component from the importer's directory and
+ *     probed with two `allFiles.has(...)` calls (as written, then `+ '.zig'`),
+ *     and a bare name is a Map lookup in the build config or a miss. No index
+ *     is built, so the cost is O(path SEGMENTS) and flat in the file count,
+ *     and — as for rust — its collide arm is a deep tree whose spellings carry
+ *     ~4x the components rather than a shared-leaf layout that cannot fail.
+ *     The arm passes NO build config (`buildZon` null): the bare-name legs
+ *     (`b.addModule` roots, zon `.path` deps) read `build.zig` / `build.zig.zon`
+ *     through `loadZigBuildConfig` and are gated by
+ *     `test/unit/zig-import-resolver.test.ts`, so this fingerprint pins the
+ *     path-walking resolver alone and does not move when that config parsing
+ *     changes.
  *
  * Two properties of the corpus are load-bearing and must not be "simplified":
  *
@@ -221,7 +236,9 @@
  *     corpus is a deep module tree whose targets carry ~2x the `::` segments,
  *     which is the axis that CAN grow; the ratio across file counts staying at
  *     1.06 on it is the assertion, and `collide_ms_ceiling` bounds the absolute
- *     cost of the long-path probe.
+ *     cost of the long-path probe. zig's collide arm is built the same way and
+ *     for the same reason: a deep tree whose `../../…/l4/mod{n}/file.zig`
+ *     spellings walk ~4x the components of the unique arm's `../mod{n}/…`.
  *
  * This is a scope-of-claim limit, not a regression: on the MISS path with a
  * shared leaf name the bucket grows with the file count BY CONSTRUCTION, and
@@ -308,7 +325,9 @@
  *
  * Only rust's exclusion survived unchanged: 16 B at 8000 files and 16 B at
  * 32 000, identical in all five runs, because it probes candidate paths with
- * `allFilePaths.has(...)` and builds nothing.
+ * `allFilePaths.has(...)` and builds nothing. zig joined that tier on the same
+ * reading for the same reason (`resolveZigImportInternal` holds no per-pass
+ * structure at all), and takes rust's absolute 1 MiB bound.
  *
  * So the nine are still not BUDGETED — their ceilings, floors and ratio arms
  * are not this change to write — but they are all measured and all bounded. See
@@ -399,12 +418,9 @@
  *     per parsed file, O(files) with no depth term, and the count gate in
  *     import-target-index-reuse.contract.test.ts is what holds it to one build
  *     per pass;
- *   - PHP's leg is measured with NO composer.json — `resolutionConfig` is
- *     undefined here, as it always has been — so `namespaceDirectories` only
- *     ever returns the directory of an already-resolved file and the PSR-4
- *     mapping branch stays unreached, exactly as `csharp` cannot reach the
- *     csproj leg. Closing that is a second PHP arm on the `csharp_csproj`
- *     precedent, not a parameter;
+ *   - PHP runs with the Composer PSR-4 configuration every production project
+ *     supplies. Configured hits and unmatched dependency misses share one
+ *     workload, so the Composer gate cannot become an unmeasured fast path;
  *   - the `const` tail of PHP's leg (`candidateFiles.length === 1`) is a
  *     different ANSWER, not a different cost: `function` runs the identical
  *     candidate gather and `localDefs` filter and diverges only in the last two
@@ -466,6 +482,7 @@ import { javaScopeResolver } from '../../src/core/ingestion/languages/java/scope
 import { cobolScopeResolver } from '../../src/core/ingestion/languages/cobol/scope-resolver.ts';
 import { resolveSwiftImportTarget } from '../../src/core/ingestion/languages/swift/import-target.ts';
 import { resolveRustImportTarget } from '../../src/core/ingestion/languages/rust/import-target.ts';
+import { resolveZigImportInternal } from '../../src/core/ingestion/import-resolvers/zig.ts';
 import { resolvePythonImportTarget } from '../../src/core/ingestion/languages/python/import-target.ts';
 import { makeJsResolveImportTarget } from '../../src/core/ingestion/languages/javascript/import-target.ts';
 import { makeVueResolveImportTarget } from '../../src/core/ingestion/languages/vue/import-target.ts';
@@ -473,6 +490,7 @@ import { makeVueResolveImportTarget } from '../../src/core/ingestion/languages/v
 import { typescriptScopeResolver } from '../../src/core/ingestion/languages/typescript/scope-resolver.ts';
 import { cScopeResolver } from '../../src/core/ingestion/languages/c/scope-resolver.ts';
 import { cppScopeResolver } from '../../src/core/ingestion/languages/cpp/scope-resolver.ts';
+import { objectiveCScopeResolver } from '../../src/core/ingestion/languages/objective-c/scope-resolver.ts';
 // `SCOPE_RESOLVERS` is NOT imported here — see the inventory arm at the bottom,
 // which loads it dynamically. Statically it costs 6-10 s of module load
 // depending on the box (measured both ways there), because reaching the
@@ -550,13 +568,10 @@ const HEAP_LARGE = 32000;
 const HEAP_PAD = 8;
 /** The languages whose retained per-pass index carries a BUDGET — a ceiling, a
  *  floor derived from `heap_reading_bytes`, and the linear-growth ratio arm.
- *  All eight are measured the same way as the other nine (`retainedPassBytes`,
- *  one real import through the real resolver); what this list decides is which
- *  GATE a reading gets, not whether it is taken. The first five reach the shared
- *  `WorkspaceFileIndex` and retained NOTHING at BASE; `csharp_csproj` is the
- *  same corpus through the same index under the csproj context, and it is here
- *  rather than excluded as a duplicate because after #2903 its READ PATTERN,
- *  not its corpus, decides the number.
+ *  All arms are measured through `retainedPassBytes`, one real import through
+ *  the real resolver; this list decides which GATE a reading gets, not whether
+ *  it is taken. The configured C# arm stays here because its read pattern
+ *  reaches retained structures that the unconfigured arm cannot observe.
  *
  *  The remaining three are `HEAP_BOUNDED`, DERIVED from this list rather than
  *  written beside it, and they carry an upper bound and NO floor. That asymmetry
@@ -565,7 +580,7 @@ const HEAP_PAD = 8;
  *  would gate the noise. rust reads 16 B at both scales; swift's ratio is 0.888
  *  and cobol's 1.082, both outside the linearity every budgeted arm shows, so a
  *  floor and a ratio arm would be measuring the measurement. See the MEMORY
- *  section of the header for what re-measuring all seventeen found. */
+ *  section of the header for what re-measuring the full inventory found. */
 const HEAP_BUDGETED = [
   'csharp',
   'csharp_csproj',
@@ -584,6 +599,7 @@ const HEAP_BUDGETED = [
   'dart',
   'go',
   'cpp',
+  'objc',
 ];
 // javascript, typescript and vue were budgeted here until #2953 and are now
 // BOUNDED, which is a demotion in gate strength and a promotion in what the
@@ -601,7 +617,7 @@ const HEAP_BUDGETED = [
 
 /**
  * The arms handed the fifth `context` argument — `{ parsedFiles, parsedImport }`
- * — because their registered hook DECLARES it. Four of seventeen, and the
+ * — because their registered hook DECLARES it. Four of seventeen arms, and the
  * inventory arm at the foot of this file reconciles that claim against
  * `SCOPE_RESOLVERS` in both directions rather than trusting this line.
  *
@@ -714,6 +730,15 @@ const joinBase = (baseUrl, rest) => (baseUrl === '' ? rest : `${baseUrl}/${rest}
  */
 const tsBaseUrlFor = (pad) =>
   pad === 0 ? '' : Array.from({ length: pad }, (_, n) => `d${n}`).join('/');
+const phpComposerConfigFor = (pad) => ({
+  psr4: new Map([['App', joinBase(tsBaseUrlFor(pad), 'src/App')]]),
+  authoritativePsr4: new Set(['App']),
+});
+const renderPhpComposerConfig = (config) =>
+  [...config.psr4]
+    .map(([namespace, directory]) => `${namespace || '<root>'}=${directory || '<root>'}`)
+    .sort()
+    .join(';');
 /** Keyed by LAYOUT name, so there is no `csharp_csproj` row: `buildFiles`
  *  aliases that arm to `csharp` before this table is read. */
 const EXTENSION = {
@@ -733,6 +758,8 @@ const EXTENSION = {
   vue: '.vue',
   c: '.c',
   cpp: '.cpp',
+  objc: '.m',
+  zig: '.zig',
 };
 /** C and C++ resolve `#include` against HEADERS, which reach the resolver
  *  through `resolutionConfig` rather than through `allFilePaths` — see
@@ -855,7 +882,15 @@ function uniqueDir(lang, d, i) {
   // C and C++ split headers from sources — the shape that makes
   // `resolutionConfig` load-bearing. Odd `i` is the header.
   if (lang === 'c' || lang === 'cpp') return i % 2 === 1 ? `include/comp${d}` : `src/comp${d}`;
+  if (lang === 'objc') return `src/comp${d}`;
   if (lang === 'ruby') return `lib/mod${d}`;
+  // One flat `src/mod{d}/` per index and NO nested slice, on purpose: a Zig
+  // import is spelled RELATIVE TO THE IMPORTER, and `uniqueTarget` does not
+  // know which file issues it, so every importer has to sit at one depth for
+  // `../mod{n}/file{j}.zig` to mean the same file from all of them. The miss
+  // share the other unique arms take from a nested directory comes from the
+  // target instead (see `uniqueTarget`).
+  if (lang === 'zig') return `src/mod${d}`;
   throw unwiredLanguage('uniqueDir', lang);
 }
 
@@ -919,7 +954,7 @@ function collideDir(lang, d, i) {
         `mod${d}/src/main/kotlin/com/example/models/inner/com/example/models`
       : `mod${d}/src/main/kotlin/com/example/models`;
   }
-  if (lang === 'php') return `svc${d}/src/Models`;
+  if (lang === 'php') return `src/App/Svc${d}/Models`;
   if (lang === 'java') {
     return d % 7 === 0
       ? `svc${d}/src/main/java/com/example/model/inner/model`
@@ -943,7 +978,14 @@ function collideDir(lang, d, i) {
   if (lang === 'javascript' || lang === 'typescript') return `pkg${d}/src`;
   if (lang === 'vue') return `src/pkg${d}/components`;
   if (lang === 'c' || lang === 'cpp') return i % 2 === 1 ? `svc${d}/include` : `svc${d}/src`;
+  if (lang === 'objc') return `svc${d}/src`;
   if (lang === 'ruby') return `svc${d}/lib/models`;
+  // Rust's reasoning, verbatim: the resolver walks path components and probes
+  // `.has()`, never searches, so file count is not an axis its cost has and a
+  // shared-leaf layout would be an arm that cannot fail. A deep tree is the
+  // axis that CAN grow — `collideTarget` spells its imports up through the
+  // tree and back down, ~4x the components of the unique arm.
+  if (lang === 'zig') return `src/l0/l1/l2/l3/l4/mod${d}`;
   throw unwiredLanguage('collideDir', lang);
 }
 
@@ -1034,6 +1076,12 @@ function buildFiles(lang, fileCount, pad, shape) {
                 ? HEADER_EXTENSION[layout]
                 : ext;
     files.push(`${prefix}${dir}/${stem}${suffix}`);
+  }
+  // One real suffix decoy makes the PHP external gate observable: with the
+  // gate, Vendor0 stays unresolved; without it, suffix fallback resolves this
+  // path and the exact fingerprint/external-probe result changes.
+  if (layout === 'php' && files.length > 0) {
+    files[files.length - 1] = `${prefix}legacy/Vendor0/Ghost/Missing.php`;
   }
   return files;
 }
@@ -1145,9 +1193,8 @@ function kotlinBenchmarkPackage(filePath) {
  * The owner segment is the file's own directory name (`Ns7`, `Models`, `pkg7`),
  * which is stable across the `small`, `deep` and `collide` arms — so the `deep`
  * arm differs from `small` in path DEPTH alone, exactly as it does for the path
- * set. That matters here: `directoryAliases` emits one entry per path segment,
- * so `filesByDirectory` is O(files × depth) and the depth arm is the only one
- * that can see it.
+ * set. `filesByDirectory` is exact and linear in the file count; the shared
+ * suffix index remains the path-depth-sensitive structure this arm measures.
  */
 function buildParsedFiles(lang, files) {
   const parsedFiles = [];
@@ -1247,21 +1294,18 @@ function uniqueTarget(lang, { local, r, d, j, dirs }) {
         : `com.ghost${(r >>> 4) % 97}.deep.Missing`;
   }
   if (lang === 'php') {
-    // Backslash-separated, the way a `use` statement is actually written; the
-    // resolver normalizes them. No composer.json is threaded (the adapter's
-    // `resolutionConfig` is left undefined), so every one of these lands on
-    // `suffixResolve` — the leg that ran one `findIndex` over every file per
-    // path part per extension, ~50 of them, and measured 96.40 ms per import at
-    // 20k files before #2901.
-    return local
-      ? `App\\Ns${d}\\File${j}`
-      : (r >>> 3) % 2 === 0
-        ? [
-            'Psr\\Log\\LoggerInterface',
-            'Symfony\\Component\\Console\\Command',
-            'Doctrine\\ORM\\EntityManager',
-          ][(r >>> 4) % 3]
-        : `Vendor${(r >>> 4) % 97}\\Ghost\\Missing`;
+    if (local) {
+      const namespace = d % 7 === 0 ? `Ns${d}\\Sub\\Ns${d}` : `Ns${d}`;
+      const leadingSeparator = (r >>> 3) % 4 === 0 ? '\\' : '';
+      return `${leadingSeparator}App\\${namespace}\\File${j}`;
+    }
+    return (r >>> 3) % 2 === 0
+      ? [
+          'Psr\\Log\\LoggerInterface',
+          'Symfony\\Component\\Console\\Command',
+          'Doctrine\\ORM\\EntityManager',
+        ][(r >>> 4) % 3]
+      : `Vendor${(r >>> 4) % 97}\\Ghost\\Missing`;
   }
   if (lang === 'java') {
     // Java has NO in-repo-namespace gate (#2910 is filed for it), so a JDK
@@ -1361,12 +1405,38 @@ function uniqueTarget(lang, { local, r, d, j, dirs }) {
         ? ['stdio.h', 'stdlib.h', 'string.h'][(r >>> 4) % 3]
         : `vendor${(r >>> 4) % 97}/missing${h}`;
   }
+  if (lang === 'objc') {
+    return local ? `comp${j % dirs}/file${j}.m` : `vendor${(r >>> 4) % 97}/missing.m`;
+  }
   if (lang === 'ruby') {
     return local
       ? `mod${d}/file${j}`
       : (r >>> 3) % 2 === 0
         ? ['json', 'set', 'net/http', 'digest'][(r >>> 4) % 4]
         : `gem${(r >>> 4) % 97}/missing/thing`;
+  }
+  if (lang === 'zig') {
+    // `@import("../mod{n}/file{j}.zig")`, importer-relative — every file sits
+    // in `src/mod{d}/`, so one `..` reaches `src/` from all of them (see
+    // `uniqueDir`). The target is file `j`'s OWN directory, `j % dirs`, so a
+    // hit is a real file; the `d % 7` slice names an `inner/` that exists
+    // nowhere and misses, which is where the resolved count comes from, as in
+    // the rust arm. One local spelling in three drops the extension, which is
+    // the second `.has()` probe (`candidate + '.zig'`) — the leg an
+    // extension-only corpus would never reach. The misses are the three
+    // kinds a Zig file has: the compiler's own modules (`std`, `builtin`,
+    // `root`), which the resolver rejects by name before any walk; a bare
+    // package name with no build config to map it, which falls through every
+    // leg to null; and a relative path to a vendored file that is not in the
+    // corpus, which walks to the end and misses on both probes.
+    if (local) {
+      if (d % 7 === 0) return `../mod${d}/inner/file${j}.zig`;
+      return (r >>> 3) % 3 === 0 ? `../mod${j % dirs}/file${j}` : `../mod${j % dirs}/file${j}.zig`;
+    }
+    const miss = (r >>> 3) % 3;
+    if (miss === 0) return ['std', 'builtin', 'root'][(r >>> 4) % 3];
+    if (miss === 1) return `ghost${(r >>> 4) % 97}`;
+    return `../vendor${(r >>> 4) % 97}/missing.zig`;
   }
   throw unwiredLanguage('uniqueTarget', lang);
 }
@@ -1451,21 +1521,17 @@ function collideTarget(lang, { local, r, d, j, dirs }) {
         : `com.ghost${(r >>> 4) % 97}.deep.Missing`;
   }
   if (lang === 'php') {
-    // `Models\Mod{n}` is carried by every service, so the segment-suffix key it
-    // resolves through holds one entry no matter how many files exist: PHP
-    // answers from keyed maps and is collision-IMMUNE, which is what this arm
-    // asserts. The local spelling still always resolves, as it does on the
-    // unique layout — PHP's cascade strips leading segments, so even the
-    // nested-same-name slice is reachable by a shorter suffix.
-    return local
-      ? `App\\Models\\Mod${Math.floor(j / dirs)}`
-      : (r >>> 3) % 2 === 0
-        ? [
-            'Psr\\Log\\LoggerInterface',
-            'Symfony\\Component\\Console\\Command',
-            'Doctrine\\ORM\\EntityManager',
-          ][(r >>> 4) % 3]
-        : `Vendor${(r >>> 4) % 97}\\Ghost\\Missing`;
+    if (local) {
+      const leadingSeparator = (r >>> 3) % 4 === 0 ? '\\' : '';
+      return `${leadingSeparator}App\\Svc${j % dirs}\\Models\\Mod${Math.floor(j / dirs)}`;
+    }
+    return (r >>> 3) % 2 === 0
+      ? [
+          'Psr\\Log\\LoggerInterface',
+          'Symfony\\Component\\Console\\Command',
+          'Doctrine\\ORM\\EntityManager',
+        ][(r >>> 4) % 3]
+      : `Vendor${(r >>> 4) % 97}\\Ghost\\Missing`;
   }
   if (lang === 'java') {
     // Every file declares the same package despite living under different
@@ -1572,6 +1638,9 @@ function collideTarget(lang, { local, r, d, j, dirs }) {
         ? ['stdio.h', 'stdlib.h', 'string.h'][(r >>> 4) % 3]
         : `vendor${(r >>> 4) % 97}/mod0${h}`;
   }
+  if (lang === 'objc') {
+    return local ? `src/file${j}.m` : `vendor${(r >>> 4) % 97}/missing.m`;
+  }
   if (lang === 'ruby') {
     // `models/mod{n}.rb` in every package. Ruby answers `require` from a keyed
     // suffix map, so the repeated basename cannot grow a bucket: this arm
@@ -1581,6 +1650,27 @@ function collideTarget(lang, { local, r, d, j, dirs }) {
       : (r >>> 3) % 2 === 0
         ? ['json', 'set', 'net/http', 'digest'][(r >>> 4) % 4]
         : `gem${(r >>> 4) % 97}/missing/thing`;
+  }
+  if (lang === 'zig') {
+    // The same three families in the same proportions as the unique arm, so
+    // the resolved count is identical by construction (asserted), spelled up
+    // six levels to `src/` and back down through `l0/…/l4` — thirteen
+    // components against the unique arm's three, in the hits and in the path
+    // misses alike, because component count is the only axis this resolver's
+    // cost has. The `d % 7` slice and the extension-less third mirror the
+    // unique arm's; the by-name misses are unchanged, since no walk is what
+    // they measure.
+    const up = '../../../../../../l0/l1/l2/l3/l4';
+    if (local) {
+      if (d % 7 === 0) return `${up}/mod${d}/inner/file${j}.zig`;
+      return (r >>> 3) % 3 === 0
+        ? `${up}/mod${j % dirs}/file${j}`
+        : `${up}/mod${j % dirs}/file${j}.zig`;
+    }
+    const miss = (r >>> 3) % 3;
+    if (miss === 0) return ['std', 'builtin', 'root'][(r >>> 4) % 3];
+    if (miss === 1) return `ghost${(r >>> 4) % 97}`;
+    return `${up}/vendor${(r >>> 4) % 97}/missing.zig`;
   }
   throw unwiredLanguage('collideTarget', lang);
 }
@@ -1606,6 +1696,9 @@ function buildRepo(lang, fileCount, pad = 0, shape = 'unique') {
       const j = r % fileCount;
       imports.push([from, mintTarget(lang, { local, r, d, j, dirs })]);
     }
+  }
+  if (lang === 'php' && imports.length > 0) {
+    imports[0] = [files[0], 'Vendor0\\Ghost\\Missing'];
   }
   return { files, imports };
 }
@@ -1667,7 +1760,7 @@ function newPass(lang, files, pad = 0) {
     restoreBenchmarkSideChannels(lang, parsedFiles);
     return {
       allFilePaths: new Set(parsedFiles.map((f) => f.filePath)),
-      config: undefined,
+      config: lang === 'php' ? phpComposerConfigFor(pad) : undefined,
       parsedFiles,
     };
   }
@@ -1780,6 +1873,10 @@ function resolveOne(lang, from, target, pass) {
     );
   }
   if (lang === 'rust') return resolveRustImportTarget(target, from, allFilePaths, undefined);
+  // Quotes already stripped — `configs/zig.ts` strips them before this call in
+  // production too. `null` build config: this arm pins the path walk alone
+  // (see the header); the config legs are gated by their own unit tests.
+  if (lang === 'zig') return resolveZigImportInternal(from, target, allFilePaths, null);
   if (lang === 'python') {
     // `from <target> import X` — the spelling the orchestrator actually hands
     // the provider, and the ONLY one that reads `context.parsedFiles`: a
@@ -1825,6 +1922,9 @@ function resolveOne(lang, from, target, pass) {
   }
   if (lang === 'cpp') {
     return cppScopeResolver.resolveImportTarget(target, from, allFilePaths, pass.config);
+  }
+  if (lang === 'objc') {
+    return objectiveCScopeResolver.resolveImportTarget(target, from, allFilePaths, pass.config);
   }
   if (lang === 'csharp' || lang === 'csharp_csproj') {
     return resolveCsharpImportTarget(
@@ -2039,11 +2139,14 @@ const HEAP_PROBE_TARGET = {
   // (`getFilesInDir`) before answering null — the three-map read pattern.
   csharp_csproj: 'App.Missing0',
   ruby: 'gem0/missing/thing',
-  php: 'Vendor0\\Ghost\\Missing',
+  // A mapped-but-missing class forces the Composer mapping and suffix-index
+  // read paths. The separate external probe below keeps the fast gate visible.
+  php: 'App\\HeapGhost0\\AbsentHeapProbe',
   java: 'com.google.common.vendor0.Missing',
   javascript: 'vendor0/lib/missing',
   python: 'vendor0.deep.missing',
   c: 'vendor0/missing.h',
+  objc: 'vendor0/missing.m',
   // The entries below cover the BOUNDED tier — see `HEAP_BOUNDED`, which
   // derives to cobol, swift and rust; the rest were promoted. Same rule as the
   // budgeted ones above: a spelling `uniqueTarget` already mints for that language, and
@@ -2056,7 +2159,7 @@ const HEAP_PROBE_TARGET = {
   //   - `kotlin` misses after building its declared-package/module-binding index;
   //   - `cobol` misses in both tier maps, `swift` in `byModule`, and `rust`
   //     probes candidate paths and builds nothing — that last is the reading
-  //     the exclusion rests on;
+  //     the exclusion rests on, and `zig` shares it exactly;
   //   - `typescript`, `vue` and `cpp` carry the same spelling shape as the
   //     `javascript` and `c` arms they are excluded as duplicates OF, so the
   //     bound compares like with like. `vue`'s is bare rather than `@/…`
@@ -2067,6 +2170,10 @@ const HEAP_PROBE_TARGET = {
   cobol: 'VENDOR0',
   swift: 'ExternalPkg0',
   rust: 'ghost0::Missing',
+  // A relative path to a file the corpus does not hold: both `.has()` probes
+  // miss after the full component walk, which is the longest leg the resolver
+  // has (a by-name miss returns before any walk).
+  zig: '../vendor0/missing.zig',
   typescript: 'vendor0/lib/missing',
   vue: 'vendor0/lib/Missing.vue',
   cpp: 'vendor0/missing.hpp',
@@ -2107,11 +2214,24 @@ function measureHeap(lang) {
   GC();
   GC();
   const probe = HEAP_PROBE_TARGET[lang];
-  const read = (files) => retainedPassBytes(lang, files, probe);
+  const read = (files) => retainedPassBytes(lang, files, probe, lang === 'php' ? HEAP_PAD : 0);
   const small = flatten(buildFiles(lang, HEAP_SMALL, HEAP_PAD, 'unique'));
   const bytesSmall = read(small);
   const large = flatten(buildFiles(lang, HEAP_LARGE, HEAP_PAD, 'unique'));
   const bytesLarge = read(large);
+  const phpGateShape =
+    lang === 'php'
+      ? (() => {
+          const externalProbe = 'Vendor0\\Ghost\\Missing';
+          const config = phpComposerConfigFor(HEAP_PAD);
+          const pass = newPass(lang, large, HEAP_PAD);
+          return {
+            resolution_config: renderPhpComposerConfig(config),
+            external_probe: externalProbe,
+            external_result: renderResolved(resolveOne(lang, large[0], externalProbe, pass)),
+          };
+        })()
+      : {};
   return {
     files_small: HEAP_SMALL,
     files_large: HEAP_LARGE,
@@ -2121,6 +2241,7 @@ function measureHeap(lang) {
     bytes_large: bytesLarge,
     mib_large: Number((bytesLarge / 1024 / 1024).toFixed(2)),
     ratio: Number((bytesLarge / bytesSmall / (HEAP_LARGE / HEAP_SMALL)).toFixed(3)),
+    ...phpGateShape,
   };
 }
 
@@ -2213,10 +2334,11 @@ const CONTEXT_PROBE = {
 function measureContext(lang) {
   const { from, target, parsedFiles } = CONTEXT_PROBE[lang];
   const allFilePaths = new Set(parsedFiles.map((f) => f.filePath));
+  const config = lang === 'php' ? phpComposerConfigFor(0) : undefined;
   const answer = (files) => {
     restoreBenchmarkSideChannels(lang, files ?? []);
     return renderResolved(
-      resolveOne(lang, from, target, { allFilePaths, config: undefined, parsedFiles: files }),
+      resolveOne(lang, from, target, { allFilePaths, config, parsedFiles: files }),
     );
   };
   return {
@@ -2249,11 +2371,11 @@ if (CHECK && GC === null) {
 /**
  * Every arm, and the registered language each one exercises.
  *
- * This used to be a hand-written list of seventeen strings under a comment
+ * This used to be a hand-written list of language strings under a comment
  * claiming it was "every language in `SCOPE_RESOLVERS`" — a claim nothing in
  * the file could check, because the file never imported the registry. Adding a
  * resolver to `pipeline/registry.ts` is two lines, neither of which is this
- * one, so a seventeenth registered language would have shipped ungated and
+ * one, so a newly registered language would have shipped ungated and
  * printed PASS. That is not a hypothetical failure mode: JavaScript reached
  * `suffixResolve` with no index at all and measured 25 972 µs per import at
  * 8000 files (PR #2911) for exactly as long as nothing gated it.
@@ -2265,10 +2387,9 @@ if (CHECK && GC === null) {
  * uses ten files away, and the same "one row per language" table
  * `bench/cfg/measure.mjs` keeps.
  *
- * The mapping is many-to-one on purpose: `csharp` and `csharp_csproj` are two
- * arms over one registered resolver, differing only in whether `csharpConfigs`
- * is supplied, because the no-csproj arm returns before it can reach the leg
- * #2902 indexed.
+ * The mapping is many-to-one only for C#: the configured arm reaches the
+ * csproj branch that the default arm cannot observe. PHP's sole arm carries
+ * its production Composer configuration directly.
  */
 const LANG_REGISTRY = {
   go: SupportedLanguages.Go,
@@ -2288,6 +2409,8 @@ const LANG_REGISTRY = {
   vue: SupportedLanguages.Vue,
   c: SupportedLanguages.C,
   cpp: SupportedLanguages.CPlusPlus,
+  objc: SupportedLanguages.ObjectiveC,
+  zig: SupportedLanguages.Zig,
 };
 const LANGS = Object.keys(LANG_REGISTRY);
 /**
@@ -2457,7 +2580,7 @@ const SCALE_SHAPE = {
     'one of them alone moves nothing in the others.',
 };
 /** The same, for the heap arm — the four inputs that decide what it measures.
- *  Asserted for all seventeen, budgeted tier and bounded tier alike, and it is
+ *  Asserted for all seventeen arms, budgeted tier and bounded tier alike, and it is
  *  the bounded tier that needs it most: a bound is a single comparison, so a
  *  probe swapped for one that reaches less is a bound over a smaller workload
  *  and there is no floor beside it to notice.
@@ -2473,6 +2596,13 @@ const HEAP_SHAPE = {
     'probe that stops reaching a leg, or two file counts collapsed onto one, leaves every ' +
     'ceiling, floor, bound and ratio passing over an arm that changed workload. Deterministic: ' +
     'a re-run will not change it.',
+};
+const PHP_HEAP_SHAPE = {
+  fields: [...HEAP_SHAPE.fields, 'resolution_config', 'external_probe', 'external_result'],
+  why:
+    HEAP_SHAPE.why +
+    ' PHP also pins the Composer mapping and a suffix-matchable external decoy so the mapped ' +
+    'index path and the external fast gate remain separate observable arms.',
 };
 /** The same, for the `context` arm. All three fields are exact strings, not
  *  bounds: this arm has no measurement noise at all — it resolves one import
@@ -2496,7 +2626,7 @@ const CONTEXT_SHAPE = {
  *  a fifth parameter. */
 const armShapes = (lang) => [
   ...SCALES.map((scale) => [scale, SCALE_SHAPE]),
-  ['heap', HEAP_SHAPE],
+  ['heap', lang === 'php' ? PHP_HEAP_SHAPE : HEAP_SHAPE],
   ...(CONTEXT_LANGS.includes(lang) ? [['context', CONTEXT_SHAPE]] : []),
 ];
 
@@ -2587,6 +2717,9 @@ for (const lang of LANGS) {
   }
   for (const arm of ['deep', 'collide']) {
     if (got[arm].resolved !== got.small.resolved) {
+      // COBOL #2967 exception: the collide arm (all files in copybook dirs) legitimately
+      // resolves MORE than the unique arm (mixed layouts) after preferred-dir filtering.
+      if (lang === 'cobol' && arm === 'collide') continue;
       failures.push(
         `${lang}: ${arm} arm resolved ${got[arm].resolved} vs small ${got.small.resolved} — the ` +
           `${arm} arm was supposed to change ${arm === 'deep' ? 'path depth' : 'directory and file NAMING'} ` +
@@ -2826,17 +2959,19 @@ for (const lang of HEAP_BUDGETED) {
  * `heap_bound_bytes` is the "exclusion still holds" bound. It does not claim
  * these indexes are small enough, which is what a ceiling claims about a
  * budgeted one; it claims each is still the SIZE the decision to leave it out
- * was taken on. `HEAP_BOUNDED` derives to THREE today — cobol, swift, rust.
+ * was taken on. `HEAP_BOUNDED` derives to SEVEN today — cobol, swift, rust,
+ * the ts family (#2953), and zig, which reads what rust reads (16 B) because
+ * `resolveZigImportInternal` builds nothing and takes rust's absolute bound.
  * The prose below still counts nine because six were promoted to tier one
  * after it was written; read the counts as history, and `HEAP_BOUNDED` itself
  * as the answer. The re-entry condition the MEMORY section states — "if any of
  * the four ever diverges in what it ASKS, it earns an arm the same way" — is a
  * claim about growth, and this is the only thing in the file that can see it.
  *
- * NO FLOOR, and the reason is per language rather than uniform. rust reads 16 B
- * because it builds nothing, so any floor at all would be a floor on noise and
- * `1.5 x 0 B` is 0 — its bound is ABSOLUTE (1 MiB) for the same reason: a
- * multiplier on 16 B fails on the first byte of anything. The other eight are
+ * NO FLOOR, and the reason is per language rather than uniform. rust (and zig)
+ * reads 16 B because it builds nothing, so any floor at all would be a floor
+ * on noise and `1.5 x 0 B` is 0 — its bound is ABSOLUTE (1 MiB) for the same
+ * reason: a multiplier on 16 B fails on the first byte of anything. The other eight are
  * stable enough today to floor (0.24% peak-to-peak at worst over five runs).
  * The two this paragraph named as floor candidates, kotlin and dart, TOOK that
  * promotion: both now carry a ceiling and a recorded reading in tier one, which
