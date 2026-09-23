@@ -393,8 +393,9 @@ function handlePostToolUse(input) {
   const command = (input.tool_input || {}).command || '';
   if (!/\bgit\s+(commit|merge|rebase|cherry-pick|pull)(\s|$)/.test(command)) return;
 
-  // Only proceed if the command succeeded
-  const toolOutput = input.tool_output || {};
+  // Only proceed if the command succeeded. Claude Code delivers the result as
+  // `tool_response`; `tool_output` is kept for runtimes that use that name.
+  const toolOutput = input.tool_response || input.tool_output || {};
   if (toolOutput.exit_code !== undefined && toolOutput.exit_code !== 0) return;
 
   const cwd = input.cwd || process.cwd();
@@ -430,12 +431,37 @@ function handlePostToolUse(input) {
   // If HEAD matches last indexed commit, no reindex needed
   if (currentHead && currentHead === lastCommit) return;
 
+  // Stay quiet while an external reindexer is already repairing this. A
+  // PostToolUse hook that runs `gitnexus analyze` detached (holding
+  // <repo>/.gitnexus/.autoreindex.lock for the analyze's duration) fires on the
+  // same tool call as this check, which runs synchronously and so reads the
+  // pre-analyze metadata and reports staleness that is fixed seconds later.
+  if (isExternalReindexRunning(repo.path)) return;
+
   const analyzeCmd = formatAnalyzeCommand({ embeddings: hadEmbeddings, indexOnly: true });
   sendHookResponse(
     'PostToolUse',
     `GitNexus index is stale (last indexed: ${lastCommit ? lastCommit.slice(0, 7) : 'never'}). ` +
       `Run \`${analyzeCmd}\` to update the knowledge graph.`,
   );
+}
+
+/**
+ * True while another process holds `<repo>/.gitnexus/.autoreindex.lock` (an
+ * flock(1) lock taken by an external reindex hook). Unheld, missing, or no
+ * `flock` binary (Windows, minimal images) all mean "not running", so the
+ * staleness notice behaves exactly as before on machines without such a hook.
+ */
+function isExternalReindexRunning(repoPath) {
+  if (process.platform === 'win32' || !repoPath) return false;
+  const lockPath = path.join(repoPath, '.gitnexus', '.autoreindex.lock');
+  if (!fs.existsSync(lockPath)) return false;
+  try {
+    const probe = spawnSync('flock', ['-n', lockPath, 'true'], { timeout: 2000, windowsHide: true });
+    return probe.status === 1; // flock -n exits 1 when the lock is held
+  } catch {
+    return false;
+  }
 }
 
 // Dispatch map for hook events
