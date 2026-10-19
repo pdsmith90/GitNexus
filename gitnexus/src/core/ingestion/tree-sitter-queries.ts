@@ -3057,7 +3057,7 @@ export const ZIG_QUERIES = `
     member: (identifier) @call.name)) @call
 `;
 
-// Julia queries — verified against tree-sitter-julia 0.23.1 by parsing real
+// Julia queries — verified against tree-sitter-julia 0.23.1 by parsing a real
 // Julia codebase. Julia is non-OO: functions are top-level generics (a "method"
 // is a dispatch of a generic function, never a member of a struct), so we emit
 // `@definition.function` only — never `@definition.method`.
