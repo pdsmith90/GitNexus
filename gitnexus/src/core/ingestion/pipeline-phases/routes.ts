@@ -14,8 +14,13 @@
 import type { PipelinePhase, PipelineContext, PhaseResult } from './types.js';
 import { getPhaseOutput } from './types.js';
 import type { ParseOutput } from './parse.js';
-import { isBladeTemplateFilename } from 'gitnexus-shared';
+import { isTemplateRouteCandidate } from '../utils/template-file.js';
 import { nextjsFileToRouteURL, normalizeFetchURL } from '../route-extractors/nextjs.js';
+import {
+  moduleStem,
+  type FetchWrapperCall,
+  type ForwardedCallee,
+} from '../route-extractors/fetch-wrapper.js';
 import { expoFileToRouteURL } from '../route-extractors/expo.js';
 import { phpFileToRouteURL } from '../route-extractors/php.js';
 import {
@@ -41,6 +46,8 @@ import { readFileContents } from '../filesystem-walker.js';
 import { isDev } from '../utils/env.js';
 
 import { logger } from '../../logger.js';
+export { isTemplateRouteCandidate } from '../utils/template-file.js';
+
 const EXPO_NAV_PATTERNS = [
   /router\.(push|replace|navigate)\(\s*['"`]([^'"`]+)['"`]/g,
   /<Link\s+[^>]*href=\s*['"`]([^'"`]+)['"`]/g,
@@ -121,17 +128,6 @@ function hasRouteParameters(routeUrl: string): boolean {
   return /\{[^}]+\}/.test(routeUrl);
 }
 
-export const isTemplateRouteCandidate = (filePath: string): boolean => {
-  const normalized = filePath.replace(/\\/g, '/').toLowerCase();
-  return (
-    normalized.endsWith('.html') ||
-    normalized.endsWith('.htm') ||
-    normalized.endsWith('.ejs') ||
-    normalized.endsWith('.hbs') ||
-    isBladeTemplateFilename(normalized)
-  );
-};
-
 export function extractTemplateStaticFetchCalls(
   filePath: string,
   content: string,
@@ -170,10 +166,6 @@ export function extractTemplateStaticFetchCalls(
   return calls;
 }
 
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 export const routesPhase: PipelinePhase<RoutesOutput> = {
   name: 'routes',
   deps: ['parse'],
@@ -186,9 +178,11 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
       allPaths,
       allFetchCalls: parseFetchCalls,
       allFetchWrapperDefs,
+      allFetchWrapperCalls,
       allExtractedRoutes,
       allDecoratorRoutes,
       routeHandlerSymbols,
+      selectedRoutes,
     } = getPhaseOutput<ParseOutput>(deps, 'parse');
 
     // Local copy — routes phase must not mutate upstream ParseOutput
@@ -304,11 +298,14 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
     for (const route of allExtractedRoutes) {
       if (!route.routePath) continue;
       const routeUrl = normalizeExtractedRoutePath(route.routePath, route.prefix);
-      addRoute(routeUrl, {
-        filePath: route.filePath,
-        source: 'framework-route',
-        method: normalizeRouteMethod(route.httpMethod),
-      });
+      if (!selectedRoutes || selectedRoutes.has(route)) {
+        addRoute(routeUrl, {
+          filePath: route.filePath,
+          source: 'framework-route',
+          method: normalizeRouteMethod(route.httpMethod),
+        });
+      }
+      // Losing declarations may still provide distinct named aliases.
       if (route.routeName && !namedRouteRegistry.has(route.routeName)) {
         namedRouteRegistry.set(route.routeName, routeUrl);
       }
@@ -318,6 +315,7 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
     // idiom, which no single file can reconcile. Framework routes are untouched;
     // their verb-less form is a declaration, not a weaker observation.
     for (const dr of reconcileDispatchGuardRoutes(allDecoratorRoutes)) {
+      if (selectedRoutes && !selectedRoutes.has(dr)) continue;
       const url = normalizeExtractedRoutePath(dr.routePath, dr.prefix ?? null);
       const method = normalizeRouteMethod(dr.httpMethod);
       const routeKey = routeNodeKey(method, url);
@@ -505,84 +503,62 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
       }
     }
 
-    // ── Cross-file fetch wrapper consumer extraction ──
-    // When the parse phase discovered functions that internally call fetch(),
-    // scan JS/TS consumer files for calls to those wrapper functions with
-    // URL-like string arguments and add them to allFetchCalls so
-    // processNextjsFetchRoutes can create FETCHES edges.
-    // Wrapper names come from two sources: functions the parse phase
-    // auto-detected as calling the bare global `fetch()`, plus any names the
-    // user declared in `.gitnexusrc` `fetchWrappers` (#1589/#1852 residual).
-    // Config names let an axios/custom-client wrapper — or one named outside the
-    // built-in convention — still produce route_map consumers; without them it
-    // silently falls back to `consumers: []`. Configured names alone are enough
-    // to run the scan even when nothing was auto-detected.
-    // Configured names are already validated/trimmed/de-duped/capped by
-    // analyze-config.ts — trusted as-is (#1589/#1852 review F9, dropped the
-    // redundant re-trim/re-filter). The single filter below guards only the
-    // auto-detected `functionName`s, which have no shape guarantee.
-    const configuredWrappers = ctx.options?.fetchWrappers ?? [];
-    const wrapperNames = new Set<string>(
-      [...(allFetchWrapperDefs ?? []).map((d) => d.functionName), ...configuredWrappers].filter(
-        (n): n is string => typeof n === 'string' && n.trim().length > 0,
-      ),
+    // Match AST candidates only after all wrapper definitions are known. The
+    // provider captures each call's complete callee and first argument during
+    // parsing; no source reread, reparse, or type-argument scanning is needed.
+    // Configured names also cover wrappers built on axios/custom clients.
+    const configuredWrappers = (ctx.options?.fetchWrappers ?? []).filter(
+      (n): n is string => typeof n === 'string' && n.trim().length > 0,
     );
+    const wrapperDefs = allFetchWrapperDefs ?? [];
+    const wrapperNames = new Set<string>([
+      ...wrapperDefs.filter((d) => d.seed).map((d) => d.functionName),
+      ...configuredWrappers,
+    ]);
+    // A function that forwards its own first parameter to a URL-carrying
+    // wrapper is one too (`fetchWithTimeout(url)` → `resilientFetch(url)` →
+    // fetch, #3488). A callee the caller's file declares or imports from a
+    // relative module must be a URL carrier in exactly that module; otherwise
+    // (a package import) the name is followed only when every recorded
+    // function of that name carries a URL. So a same-named function elsewhere
+    // (an IPC `request(channel)`) or a fetch caller whose first parameter is
+    // not the URL (`track(event)`) lends nothing. The set only grows, so this
+    // reaches a fixed point.
+    const carriers = new Set(wrapperDefs.filter((d) => d.forwardsUrl));
+    const defsByName = new Map<string, typeof wrapperDefs>();
+    const defsByModule = new Map<string, typeof wrapperDefs>();
+    for (const def of wrapperDefs) {
+      const key = `${moduleStem(def.filePath)}\0${def.functionName}`;
+      defsByName.set(def.functionName, [...(defsByName.get(def.functionName) ?? []), def]);
+      defsByModule.set(key, [...(defsByModule.get(key) ?? []), def]);
+    }
+    const carriesUrl = ({ callee, module }: ForwardedCallee): boolean =>
+      configuredWrappers.includes(callee) ||
+      (module === null
+        ? (defsByName.get(callee)?.every((def) => carriers.has(def)) ?? false)
+        : (defsByModule.get(`${module}\0${callee}`)?.some((def) => carriers.has(def)) ?? false));
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const def of wrapperDefs) {
+        if (carriers.has(def) || !def.forwardsTo.some(carriesUrl)) continue;
+        carriers.add(def);
+        wrapperNames.add(def.functionName);
+        grew = true;
+      }
+    }
+    // A call whose callee the file declares or imports relatively must reach a
+    // wrapper in exactly that module; a package or member callee keeps the
+    // name match.
+    const isWrapperCall = ({ functionName, module, declaredName }: FetchWrapperCall): boolean =>
+      configuredWrappers.includes(functionName) ||
+      (module === undefined
+        ? wrapperNames.has(functionName)
+        : (defsByModule
+            .get(`${module}\0${declaredName ?? functionName}`)
+            ?.some((def) => def.seed || carriers.has(def)) ?? false));
     if (wrapperNames.size > 0 && routeRegistry.size > 0) {
-      const jsFiles = allPaths.filter((p) => /\.[jt]sx?$/.test(p));
-      if (jsFiles.length > 0) {
-        // Reuse contents already read for handler extraction; only read the
-        // remainder (mirrors the Expo block above). Avoids a second full read of
-        // files we already have in memory.
-        const unreadJsFiles = jsFiles.filter((p) => !handlerContents?.has(p));
-        const extraContents =
-          unreadJsFiles.length > 0
-            ? await readFileContents(ctx.repoPath, unreadJsFiles)
-            : new Map<string, string>();
-        // One alternation regex over every wrapper name per file — O(files), not
-        // O(files × wrappers) (#1852 review F3). Names are escaped and grouped
-        // non-capturing so capture group 1 stays the URL. The left boundary is a
-        // negative lookbehind, not `\b`: a bare configured name like `get` must
-        // match the free call `get('/x')` but NOT a member access `client.get(`
-        // (a `.get(` on an unrelated object), and `apiFetch` must not match
-        // `myApiFetch`. Member-style wrappers are configured with the dot
-        // (`client.get`), where the `.` is part of the pattern. The `u` flag +
-        // Unicode property classes make the boundary cover non-ASCII identifier
-        // characters too — ASCII `\w` would let `caféget('/x')` match `get`
-        // (#1852 review F10).
-        const alternation = [...wrapperNames].map(escapeRegex).join('|');
-        const wrapperCallRegex = new RegExp(
-          `(?<![.\\p{L}\\p{N}_$])(?:${alternation})\\s*\\(\\s*['"\`](/[^'"\`\\s)]+)['"\`]`,
-          'gu',
-        );
-        const scanContent = (filePath: string, content: string): void => {
-          wrapperCallRegex.lastIndex = 0;
-          // 1-based line number via a running newline counter: matches arrive in
-          // ascending index, so accumulate newlines incrementally instead of
-          // re-allocating `content.substring(0, match.index).split('\n')` on
-          // every match (#1852 review F12). Output is identical.
-          let line = 1;
-          let scanned = 0;
-          let match;
-          while ((match = wrapperCallRegex.exec(content)) !== null) {
-            for (; scanned < match.index; scanned++) {
-              if (content.charCodeAt(scanned) === 10 /* '\n' */) line++;
-            }
-            allFetchCalls.push({
-              filePath,
-              fetchURL: match[1],
-              lineNumber: line,
-            });
-          }
-        };
-        for (const [filePath, content] of extraContents) scanContent(filePath, content);
-        // Also scan already-read JS/TS handler files (a handler can itself
-        // consume another route through a wrapper).
-        if (handlerContents) {
-          for (const p of jsFiles) {
-            const cached = handlerContents.get(p);
-            if (cached !== undefined) scanContent(p, cached);
-          }
-        }
+      for (const call of allFetchWrapperCalls ?? []) {
+        if (isWrapperCall(call)) allFetchCalls.push(call);
       }
     }
 

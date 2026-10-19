@@ -39,7 +39,6 @@ import { computeDartArityMetadata } from './arity-metadata.js';
 import { synthesizeDartReceiverBinding } from './receiver-binding.js';
 import { synthesizeDartSignatureBindings } from './signature-bindings.js';
 import { getDartParser, getDartScopeQuery } from './query.js';
-import { preprocessDartExtensionTypes } from './extension-type-preprocess.js';
 import { recordCacheHit, recordCacheMiss } from './cache-stats.js';
 import { getTreeSitterBufferSize } from '../../constants.js';
 import { parseSourceSafe } from '../../../tree-sitter/safe-parse.js';
@@ -156,17 +155,13 @@ export function emitDartScopeCaptures(
   _filePath: string,
   cachedTree?: unknown,
 ): readonly CaptureMatch[] {
-  // Idempotent re-application: `extractParsedFile` already preprocesses, but
-  // direct emitter callers (benchmarks, capture goldens) must see the same
-  // program the pipeline does.
-  const parseText = preprocessDartExtensionTypes(sourceText);
   let tree: Parser.Tree;
   if (cachedTree !== undefined && cachedTree !== null) {
     tree = cachedTree as Parser.Tree;
     recordCacheHit();
   } else {
-    tree = parseSourceSafe(getDartParser(), parseText, undefined, {
-      bufferSize: getTreeSitterBufferSize(parseText),
+    tree = parseSourceSafe(getDartParser(), sourceText, undefined, {
+      bufferSize: getTreeSitterBufferSize(sourceText),
     });
     recordCacheMiss();
   }
@@ -291,7 +286,10 @@ export function emitDartScopeCaptures(
   // ── Pass B: tree-walked references, type inference, heritage ────────────
   const seenReadSpans = new Set<string>();
   walkNamedTree(root, (node) => {
-    if (node.type === 'selector') {
+    if (
+      node.type === 'selector' ||
+      (ASSIGNABLE_SELECTORS.has(node.type) && node.parent?.type !== 'selector')
+    ) {
       emitSelectorReference(node, out, seenReadSpans);
       return;
     }
@@ -308,7 +306,7 @@ export function emitDartScopeCaptures(
       emitDartFieldAssignmentBindings(node, out, memo);
       return;
     }
-    if (node.type === 'extension_declaration') {
+    if (node.type === 'extension_declaration' || node.type === 'extension_type_declaration') {
       emitExtensionImplementsHeritage(node, out);
       return;
     }
@@ -446,7 +444,7 @@ function computeReceiverText(nameSelector: SyntaxNode): string | null {
   let cur = nameSelector.previousNamedSibling;
   let head: SyntaxNode | null = null;
   while (cur !== null) {
-    if (cur.type === 'selector') {
+    if (cur.type === 'selector' || ASSIGNABLE_SELECTORS.has(cur.type)) {
       selectors.push(cur);
       cur = cur.previousNamedSibling;
       continue;
@@ -467,7 +465,9 @@ function emitSelectorReference(
   out: CaptureMatch[],
   seenReadSpans: Set<string>,
 ): void {
-  const inner = selector.namedChild(0);
+  // `super.member` and the final member of an assignment target are bare
+  // assignable selectors; other postfix members have a `selector` wrapper.
+  const inner = selector.type === 'selector' ? selector.namedChild(0) : selector;
   if (inner === null) return;
 
   // A `selector(argument_part)` is the call marker; the callee is the
@@ -492,8 +492,8 @@ function emitSelectorReference(
       });
       return;
     }
-    if (prev.type === 'selector') {
-      const prevInner = prev.namedChild(0);
+    if (prev.type === 'selector' || ASSIGNABLE_SELECTORS.has(prev.type)) {
+      const prevInner = prev.type === 'selector' ? prev.namedChild(0) : prev;
       if (prevInner === null) return;
       if (ASSIGNABLE_SELECTORS.has(prevInner.type)) {
         const nameId = selectorName(prevInner);
@@ -514,8 +514,8 @@ function emitSelectorReference(
     return;
   }
 
-  // A member access selector that is NOT immediately followed by a call is a
-  // field read (`user.address` in `user.address.save()`).
+  // A member not followed by a call is a read, except the final selector on
+  // an assignment's left side. Intermediate receivers remain reads.
   if (ASSIGNABLE_SELECTORS.has(inner.type)) {
     const next = selector.nextNamedSibling;
     const isCall =
@@ -531,8 +531,14 @@ function emitSelectorReference(
     if (seenReadSpans.has(spanKey)) return;
     seenReadSpans.add(spanKey);
 
+    const target = selector.parent;
+    const isWrite =
+      target?.type === 'assignable_expression' &&
+      target.lastNamedChild?.id === selector.id &&
+      target.parent?.childForFieldName('left')?.id === target.id;
+    const tag = isWrite ? '@reference.write.member' : '@reference.read.member';
     out.push({
-      '@reference.read.member': nodeToCapture('@reference.read.member', nameId),
+      [tag]: nodeToCapture(tag, nameId),
       '@reference.name': nodeToCapture('@reference.name', nameId),
       '@reference.receiver': syntheticCapture('@reference.receiver', selector, recv),
     });
@@ -1118,8 +1124,11 @@ function emitExtensionImplementsHeritage(extensionNode: SyntaxNode, out: Capture
   const nameNode = extensionNode.childForFieldName('name');
   if (nameNode === null) return;
 
-  const bodyStart = extensionNode.text.indexOf('{');
-  const header = bodyStart === -1 ? extensionNode.text : extensionNode.text.slice(0, bodyStart);
+  const body = extensionNode.childForFieldName('body');
+  const header =
+    body === null
+      ? extensionNode.text
+      : extensionNode.text.slice(0, body.startIndex - extensionNode.startIndex);
   const implementsIndex = header.indexOf('implements');
   if (implementsIndex === -1) return;
 

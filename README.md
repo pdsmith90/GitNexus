@@ -169,7 +169,7 @@ flowchart TB
 | `trace`          | Shortest directed path between two symbols (call + class-member edges) |
 | `detect_changes` | Git-diff impact — maps changed lines to affected processes             |
 | `check`          | Read-only structural checks against the indexed graph                  |
-| `rename`         | Multi-file coordinated rename with graph + text search                 |
+| `rename`         | Semantic rename — previews by default, `dry_run: false` with the preview's `plan_token` applies its exact reviewed edits |
 | `cypher`         | Raw Cypher graph queries                                               |
 | `route_map`      | API route map — which components fetch which endpoints, and handlers   |
 | `tool_map`       | MCP/RPC tool definitions — where they're defined and handled           |
@@ -372,7 +372,7 @@ codex plugin marketplace add abhigyanpatwari/GitNexus
 <details>
 <summary><strong>MCP read-only mode</strong></summary>
 
-Set `GITNEXUS_MCP_READ_ONLY=1` before starting the MCP server to expose only the proven single-repository read surface. Raw `cypher`, rename and group tools, group routing, and group resources are omitted from discovery and rejected before backend dispatch. Tool descriptions and generated setup/context resources are scrubbed so they do not recommend unavailable routes.
+Set `GITNEXUS_MCP_READ_ONLY=1` before starting the MCP server to expose only the proven single-repository read surface. `rename` stays available as a preview-only tool: its `dry_run` must be omitted or `true`, and any other value is rejected before backend dispatch. Raw `cypher`, group tools, group routing, and group resources are omitted from discovery and rejected before backend dispatch. Tool descriptions and generated setup/context resources are scrubbed so they do not recommend unavailable routes.
 
 The default is unchanged when the variable is unset or `0`. Any other value fails server startup rather than silently weakening the policy.
 
@@ -390,6 +390,22 @@ The default repository must resolve to an allowed repository. Invalid, ambiguous
 <details>
 <summary><strong>MCP response budgets</strong></summary>
 
+Prefer explicit response filters before a byte cutoff. Single-repository MCP
+`query` and `context` accept `response_sections`: choose query sections
+(`processes`, `process_symbols`, `definitions`) or context sections (`incoming`,
+`outgoing`, `processes`, `chain`, `routes`, `typed_properties`). Context always
+keeps the selected symbol and also accepts `relationTypes: ["CALLS"]` to show
+only that category in the existing incoming/outgoing reference window. These
+options do not change graph search, ranking or traversal. They are not supported
+for `@group` routing; use a member's indexed repository name/path instead.
+
+For example, `context({uid: "<returned symbol id>", response_sections: ["incoming"],
+relationTypes: ["CALLS"]})` returns the symbol, its returned callers, and all
+completeness/staleness diagnostics. The `response_filter` field identifies omitted
+data; omission does not mean absence. Remove filters for a broader view. For
+impact, existing `summaryOnly`, `limit` and `offset` already provide focused views.
+Omitting these filters preserves the existing response.
+
 The `query`, `context`, and `impact` tools accept an optional positive-integer `maxTokens` argument. It bounds the complete formatted MCP response, including hints and error text, using a deterministic four-UTF-8-bytes-per-token estimate. When truncation is required, the response ends with `…` and remains valid UTF-8.
 
 Set `GITNEXUS_MCP_DEFAULT_MAX_TOKENS` to apply the same guardrail when callers do not send `maxTokens`. An explicit tool argument takes precedence. Leaving both unset preserves the existing response byte-for-byte; this is a transport guardrail, not semantic pagination or an exact model-specific tokenizer limit.
@@ -404,7 +420,8 @@ Everyday commands:
 gitnexus setup                   # Configure MCP for detected editors (one-time; -c to select)
 gitnexus analyze [path]          # Index a repository (or update a stale index)
 gitnexus analyze [path] --watch  # Watch local files and serialize incremental refreshes
-gitnexus mcp                     # Start MCP server (stdio) — serves all indexed repos
+gitnexus mcp                     # Start MCP server (stdio; one server PER CLIENT) — all indexed repos
+gitnexus mcp --http              # Start MCP server (Streamable HTTP + SSE) — ONE server, many clients
 gitnexus serve                   # Start local HTTP server (multi-repo) for web UI connection
 gitnexus eval-server             # Start lightweight evaluation HTTP tools (loopback by default)
 gitnexus list                    # List all indexed repositories
@@ -413,6 +430,26 @@ gitnexus clean                   # Delete index for current repo
 gitnexus wiki [path]             # Generate repository wiki from knowledge graph
 gitnexus uninstall               # Preview removal of GitNexus MCP/skills/hooks (--force to apply)
 ```
+
+### Multi-client setups: use `--http`, not stdio
+
+MCP-over-stdio is **one server process per client** by protocol design — every client
+spawns its own `gitnexus mcp` child, with its own copy of the loaded index. If you run N
+concurrent agents/workers, that is N full index servers.
+
+`gitnexus mcp --http` starts **one** server (Streamable HTTP at `POST /mcp`, legacy SSE at
+`GET /sse` + `POST /messages`) that any number of clients can connect to:
+
+```bash
+gitnexus mcp --http --host 127.0.0.1 --port 3111
+```
+
+Point clients at `http://127.0.0.1:3111/mcp`. A non-loopback bind (`--host 0.0.0.0`)
+requires `--auth-token` (or `GITNEXUS_MCP_AUTH_TOKEN`) and refuses to start without it.
+
+Measured on a 5-core host with 3 indexed repos, 5 concurrent clients issuing the same
+query: shared `--http` ran the batch in 7.7 s at a flat 517 MB, versus 30.0 s and
++514 MB (~103 MB per extra client) for per-client stdio — with identical results.
 
 You can also query the graph directly from the terminal — `gitnexus query`, `context`, `impact`, `trace`, `cypher`, `detect-changes`, and `check` mirror the MCP tools of the same names, and `gitnexus doctor` prints runtime platform capabilities.
 
@@ -611,11 +648,13 @@ Most `analyze` knobs are also CLI flags (`--workers`, `--worker-timeout`, `--max
 
 | Variable                                        | Default                            | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Tune when…                                                                                                                                                                            |
 | ----------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GITNEXUS_TEST_REPORT` | unset | Write a JSON execution receipt from `scripts/run-cross-platform.ts`; accepts a basename ending in `.json`. | CI platform shards use distinct filenames so the completeness check can require every report. |
 | `GITNEXUS_WORKER_POOL_SIZE`                     | `cores - 1`, capped at 16          | Parse worker pool size (must be ≥ 1). Equivalent to `--workers <n>`. The worker pool is the sole parse path — there is no sequential parser, so `0` is rejected with an actionable error (the pool self-heals via quarantine + respawn).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Constrained containers (cgroup CPU limits) or CI runners with explicit quotas. To narrow down a worker crash set `1` for a single-worker pool — not `0`.                              |
 | `GITNEXUS_PARSE_CHUNK_CONCURRENCY`              | `2`                                | Number of chunks whose file contents may be read into memory in parallel while the pool dispatches the current chunk. Worker dispatch itself stays serial.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Repos large enough to chunk (multi-MB total source) where disk I/O is a measurable fraction of analyze wall-clock.                                                                    |
 | `GITNEXUS_VERBOSE`                              | unset                              | When `1`, enables verbose ingestion logs (skipped-file warnings, per-chunk throughput, parse-cache stats). Equivalent to `--verbose`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Debugging an analyze that "completed" but seems to have missed files; tuning `--workers` / chunk concurrency against observable throughput.                                           |
 | `GITNEXUS_EMBEDDING_RETRY_TIMEOUTS`             | unset                              | When truthy (`1`/`true`/`yes`), per-attempt HTTP embedding timeouts (`TimeoutError` on fetch or body read) go through the bounded `GITNEXUS_EMBEDDING_MAX_ATTEMPTS` retry loop instead of failing the job. Any other value leaves it off, so cloud/default timeouts remain terminal.                                                                                                                                                                                                                                                                                                                                                      | Local accelerators that drop a device lock when the client disconnects and succeed on the next request (observed with FastFlowLM on Ryzen AI).                                        |
 | `GITNEXUS_EMBEDDING_SIDECAR_TIMEOUT_MS`         | `180000` (3 minutes)               | Per-request IPC timeout for local embedding sidecar embed batches. On overrun the parent SIGKILLs the sidecar child and rejects the batch. Init still uses the HF download budget (`HF_DOWNLOAD_TIMEOUT_MS` × attempts), not this knob.                                                                                                                                                                                                                                                                                                                                  | Large embed batches or slow local ONNX inference cause sidecar request timeouts during `analyze --embeddings`, `embeddings sync`, serve, or MCP.                                      |
+| `GITNEXUS_VECTOR_MAX_DISTANCE` | `0.6` for CLI/MCP `query`; `0.5` for standalone semantic search | Maximum cosine distance for vector hits, applied to both indexed search and exact-scan fallback. Hits must have `distance < cutoff`. Unset/blank uses the default; non-numeric, non-finite, zero, or negative values warn and use the default; finite values above `2` warn and clamp to `2`. | Paraphrased queries have weak semantic recall with your embedding model. See [Vector cutoff tuning](#vector-cutoff-tuning). |
 | `GITNEXUS_ANALYZER_IDENTITY_IN_PROCESS_GUARDS`  | unset                              | When truthy (`1`/`true`/`yes`), forces in-process cache-guard validation once a batch has ≥128 requests. In-process mode also auto-selects when `packageRoot`/`buildRoot` fail `W_OK` with `EACCES`/`EROFS`. Otherwise those large batches use a Node subprocess probe. Batches under 128 always stay in-process.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Trusted or read-only installs where two identity subprocess spawns per analyze dominate wall time; leave unset to keep the default isolation path on writable trees. |
 | `GITNEXUS_RESOLVE_DEF_GRAPH_ID_MEMO`            | on (unset)                         | Memoizes `resolveDefGraphId` per `nodeLookup` instance (WeakMap). Enabled by default. Set to `0`/`false`/`off`/`no` to disable and recompute on every call (debug / bisect memo bugs).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Suspecting stale graph-id resolution after a lookup rebuild, or comparing memo vs uncached cost on a large index. |
 | `GITNEXUS_AUTH_TOKEN`                           | unset                              | Bearer token required when `eval-server` binds beyond loopback. May also be read from `.env.local` or `.env`; shell values take precedence.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Exposing the evaluation HTTP tools to a container, VM, or LAN.                                                                                                                        |
@@ -638,7 +677,8 @@ Most `analyze` knobs are also CLI flags (`--workers`, `--worker-timeout`, `--max
 | `GITNEXUS_SKIP_FTS` | unset | When exactly `1`, skips FTS extension loading and keyword index creation during analyze. Equivalent to `--skip-fts`; a later analyze without either option restores FTS. | Graph-only consumers with their own retrieval, or short-lived indexes that do not need keyword search. |
 | `GITNEXUS_WAL_CHECKPOINT_THRESHOLD`             | `67108864` (64 MiB)                | LadybugDB WAL auto-checkpoint threshold in bytes. Equivalent to `--wal-checkpoint-threshold <bytes>`. `-1` keeps LadybugDB's stock threshold (~16 MiB). Larger thresholds reduce checkpoint frequency but increase the WAL size at rotation time — choose a smaller value on disk-constrained environments.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | You need a larger or smaller WAL auto-checkpoint threshold for your analyze workload.                                                                                                 |
 | `GITNEXUS_LBUG_BUFFER_POOL_SIZE`                | min(2 GiB, 80% RAM)                | LadybugDB buffer-pool ceiling in bytes for every GitNexus database (analyze, MCP server, serve, group bridges). `0` restores LadybugDB's native unbounded default of 80% of system RAM; invalid values warn and fall back to the default (#2557). During `analyze` the pool is right-sized to the graph, scaled on non-4 KiB-page hosts by the page-size granule ratio up to min(2 GiB × pageSize/4 KiB, 80% RAM) (#2631); this env var overrides all of that as an absolute value.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | A long-lived `gitnexus mcp` or a big incremental `analyze` uses too much memory, or a huge repo's working set genuinely needs a pool larger than 2 GiB.                               |
-| `GITNEXUS_LBUG_MAX_DB_SIZE`                     | `17179869184` (16 GiB)             | Maximum size in bytes of a single LadybugDB database file — an mmap/disk-address-space ceiling, not a memory limit (it does not constrain the buffer pool). Invalid values silently fall back to the default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Indexing a genuinely huge monorepo whose on-disk graph index approaches 16 GiB.                                                                                                       |
+| `GITNEXUS_LBUG_MAX_DB_SIZE`                     | `17179869184` (16 GiB)             | Maximum size in bytes of a single LadybugDB database file — an mmap/disk-address-space ceiling, not a memory limit (it does not constrain the buffer pool). The native engine requires a power of two: any other positive integer is rounded up to the next power of two with a warning, and invalid values silently fall back to the default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Indexing a genuinely huge monorepo whose on-disk graph index approaches 16 GiB.                                                                                                       |
+| `GITNEXUS_ATOMIC_INCREMENTAL` | unset (the caller's choice) | `1` stages an incremental analyze into a copy of the index and swaps it in at the end, so a failed run leaves the live index untouched. `0` turns that off even for callers that request it (watch mode, auto-sync); the run logs a line when it overrides one. The cost: a failed in-place write can leave the live index partly written, and the next run then rebuilds it in full. A full rebuild, and an incremental run that escalates to a staged rebuild, still stage. POSIX only. | A staged incremental analyze fails (see *Troubleshooting* in the package README), or you need in-place writes. |
 | `GITNEXUS_WORKER_SUB_BATCH_MAX_BYTES`           | `8388608` (8 MB)                   | Per-job byte budget the pool will send to a worker in one `postMessage`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Very large individual files; mostly diagnostic — bumping past 8 MB risks structured-clone memory pressure.                                                                            |
 | `GITNEXUS_WORKER_MAX_RESPAWNS_PER_SLOT`         | `3`                                | Max replacement spawns per worker slot before the slot is dropped from the active rotation. Bounds respawn loops on a chronically-crashing slot.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Hosts where a flaky worker should retry more (raise) or fail-fast (lower) before the slot is dropped.                                                                                 |
 | `GITNEXUS_WORKER_MAX_CUMULATIVE_TIMEOUT_MS`     | `5 × subBatchTimeoutMs`            | Total retry wall-time budget per job before quarantining. Combined with `timeoutBackoffFactor`, prevents exponentially-growing retries from stalling for hours.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Slow files that legitimately need long total retry windows; lower to fail-fast on stalls.                                                                                             |
@@ -654,6 +694,22 @@ Most `analyze` knobs are also CLI flags (`--workers`, `--worker-timeout`, `--max
 | `GITNEXUS_MCP_DEFAULT_MAX_TOKENS`               | unset                              | Default positive-integer response budget for MCP `query`, `context`, and `impact`, estimated at four UTF-8 bytes per token. Explicit `maxTokens` wins.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Long MCP responses consume too much model context and callers cannot reliably add a per-request budget.                                                                               |
 | `GITNEXUS_PUBLIC_ORIGIN`                        | unset                              | The single browser origin `serve` is reached through, added to the CORS allowlist and to the write-route origin guard. A wildcard bind (`0.0.0.0`) has no host identity, so without this the server's own UI is refused. **Setting it currently refuses to start:** `serve` has no authentication, requests carrying no `Origin` header already reach `POST /api/analyze` and `DELETE /api/repo`, and this is the setting that would admit browser writes on top of that. Matching rules for when the gate lifts: the hostname must match exactly, and so must the scheme. A value with no scheme (`app.example.com`) means `https`, since a bare host comes from platform service discovery and those terminate TLS; spell out `http://app.example.com` for plain HTTP. An explicit port must match; with no port, any port on that hostname is accepted. Anything that is not one reachable host (a list, `*`, a bare port number, a `:0` port, a trailing dot) warns at startup and allows nothing.                   | `gitnexus serve` runs behind a reverse proxy or on a wildcard bind, and the UI's index/delete requests return `origin_not_allowed`.                                                   |
 | `GITNEXUS_TRUST_PROXY`                          | `loopback, linklocal, uniquelocal` | Express `trust proxy` value — which upstream hops may set `X-Forwarded-*`, and so what the per-IP rate limiter reads as the client IP. Set it to the exact number of proxies you control. Every hop past that is one more entry of the chain the caller gets to write. `false`/`no`/`off` (and a `0` hop count) trust no hop; a proxy list Express can compile (`loopback`, `10.0.0.0/8, 127.0.0.1`) names them instead. `true`/`yes`/`on` is **rejected**: it reads the client-controlled leftmost `X-Forwarded-For` entry, so a spoofed chain earns a fresh rate-limit key per request, and express-rate-limit rejects it too (`ERR_ERL_PERMISSIVE_TRUST_PROXY`). Counts above `16` are rejected as well, as a sanity ceiling rather than a safety boundary. Any invalid value warns and falls back to the default. Bind non-loopback with this unset and `serve` warns: a load balancer outside the private ranges is untrusted, so every request keys to the balancer and the per-IP limit becomes one shared limit. | `serve` sits behind a load balancer outside the private ranges (AWS ALB, Cloudflare, CGNAT), where every request otherwise collapses to the proxy hop and rate limiting goes global.  |
+
+### Vector cutoff tuning
+
+`GITNEXUS_VECTOR_MAX_DISTANCE` controls which vector candidates enter hybrid search. Cosine distance is lower for more similar vectors; the appropriate cutoff depends on the embedding model and repository. A higher cutoff can recover useful semantic matches, but can also admit less relevant hits and change the fused ranking. The default is `0.6` for CLI and MCP `query`, and `0.5` for the standalone semantic-search function.
+
+For an index that already has embeddings, compare the default with `0.8` and `1.0` on representative queries, including paraphrases, exact symbol names, and queries that should have no relevant result:
+
+```bash
+GITNEXUS_VECTOR_MAX_DISTANCE=0.8 gitnexus query "how are expired sessions removed" --limit 10
+```
+
+Check both whether the expected symbols appear and where they rank. In [#3457](https://github.com/abhigyanpatwari/GitNexus/issues/3457), the reporter's `voyage-code-4` sample found 20 of 32 paraphrased targets at `0.6`, 25 at `0.8`, and 28 at `1.0`. Those values are a tuning starting point for that model, not universal recommendations: one paraphrased target fell from first to twelfth at `1.0`. The sample covered eight repositories, recorded no raw distances, used agent-written queries after reading the code, and did not send Voyage's `input_type`.
+
+Set the variable in the process that runs the search. For MCP, add it to the server's launch environment and restart the server; for `gitnexus serve`, set it in that process's environment and restart it. Setting it only during `analyze`, or exporting it in another shell, does not configure an existing server. Changing the cutoff requires no reindex.
+
+The cutoff only filters available vector candidates. It cannot add missing embeddings or repair a mismatch between the indexing and query-time embedding configuration; see the [embeddings runbook](RUNBOOK.md#embeddings). A cutoff of `2` is very permissive, but still rejects distance exactly `2` and retains the search candidate limits.
 
 </details>
 
@@ -707,7 +763,7 @@ GitNexus builds a complete knowledge graph of your codebase through a multi-phas
 
 **Imports** — cross-file import resolution · **Named Bindings** — `import { X as Y }` / re-export tracking · **Exports** — public/exported symbol detection · **Heritage** — class inheritance, interfaces, mixins · **Type Annotations** — explicit type extraction for receiver resolution · **Constructor Inference** — infer receiver type from constructor calls (`self`/`this` resolution included for all languages) · **Config** — language toolchain config parsing (tsconfig, go.mod, etc.) · **Frameworks** — AST-based framework pattern detection · **Entry Points** — entry point scoring heuristics
 
-**Control flow (CFG, opt-in `--pdg`)** — per-function control-flow graphs (`BasicBlock` nodes + `CFG` edges) feeding the PDG/taint substrate, currently **TypeScript & JavaScript** (#2081 M1); other languages planned. Off by default.
+**Control flow (CFG, opt-in `--pdg`)** — provider-owned control-flow graphs (`BasicBlock` nodes + `CFG` edges) feed control dependence and reaching definitions across the registered source languages. AST providers describe callable regions; COBOL uses source-backed program regions. Unsupported constructs and region limits produce explicit skips. Off by default.
 
 ### Multi-Repo Architecture
 
@@ -856,18 +912,71 @@ changed_symbols: [validateUser, AuthService, ...]
 affected_processes: [LoginFlow, RegistrationFlow, ...]
 ```
 
-### Rename (Multi-File)
+### Rename (Graph and Semantic Layer)
 
+```js
+rename({symbol_name: "validateUser", new_name: "verifyUser", repo: "my-app", dry_run: true})
+// Omitting dry_run also previews. For an ambiguous name, repeat with the symbol_uid from context().
 ```
-rename({symbol_name: "validateUser", new_name: "verifyUser", dry_run: true})
 
+```text
+result_version: 2
 status: success
+planning_status: ready
+application_status: not_requested
+applied: false
 files_affected: 5
 total_edits: 8
-graph_edits: 6     (high confidence)
-text_search_edits: 2  (review carefully)
-changes: [...]
+semantic_edits: 8
+graph_edits: 0
+text_search_edits: 0
+text_search: not_used
+coverage: {name: "gitnexus-semantic", scope: "indexed-repository", languages: [...], limitations: [...], ...}
+changes: [{file_path, edits: [{start, length, old_text, new_text, line, confidence: "semantic"}]}]
 ```
+
+Review the exact UTF-16 spans and coverage, then call `rename` with the same
+selectors, `dry_run: false`, and its returned `plan_token` to apply exactly those edits.
+Tokens are single-use, expire after 15 minutes or a server restart, and may be
+evicted by the bounded retained-plan cache. Changed source contents, physical
+targets, indexed declarations, provider resolution configuration or source-file sets (including untracked additions)
+require a fresh reviewed preview. Omitting `dry_run` also previews.
+Configuration is compared by provider resolution semantics; comment-only changes
+that preserve those semantics are accepted. Unedited source aliases of an edited
+physical file block preview. Apply checks configuration before the first write
+and source contents and approved targets before each replacement; these checks
+assume a cooperative checkout and do not form a filesystem transaction.
+Counts describe occurrences, including multiple edits on one line. The graph
+selects indexed declarations and files; GitNexus's language providers rebuild
+semantic scopes from the current source and resolve exact name spans.
+
+Rename does not load a compiler or language service. Comments, strings, and
+unrelated same-spelled symbols are preserved. Unsupported syntax, ambiguous
+bindings, stale declarations, and incomplete occurrence coverage block writes.
+Coverage includes indexed files accepted by the selected language provider,
+including its supported embedded-language sources, and excludes unindexed files
+and external consumers. Each registered source-language provider supplies rename
+rules. Constructor, destructor, inheritance, and interface families require
+complete provider evidence. Dynamic or computed references block a rename when
+the provider cannot prove their binding or exclude them from the selected family.
+`rename` operates on the current checkout and rejects `branch`.
+
+Language-specific limits remain explicit in the result. For example, PHP handles
+case-insensitive function/class names separately from case-sensitive constants
+and properties, but refuses class renames that require moving a PSR-4 file.
+Java also refuses public top-level type renames that require a source-file move.
+Rename edits source spans; it does not move files or rewrite dynamic string names.
+
+Preview and apply recompute their plans independently. Source snapshots are
+checked before writes; this is not a cross-call preview token or transactional
+filesystem operation. The final destination check and replacement are separate
+operations, so another process can still change a file between them. Avoid
+concurrent source writes during application. On a write failure, `status: partial` and `failed_files`
+report the failed file and `unattempted_files` lists the later files that were never touched;
+`applied`, counts, and `changes` describe only landed edits.
+Inspect failures before retrying, and run type checking, tests, and
+`detect_changes` after applying. A valid identifier is not a guarantee against
+new-name collisions.
 
 ### Cypher Queries
 
@@ -1127,7 +1236,7 @@ Built by the community — not officially maintained, but worth checking out.
 | **Database**        | LadybugDB native                      | LadybugDB WASM                          |
 | **Embeddings**      | HuggingFace transformers.js (GPU/CPU) | transformers.js (WebGPU/WASM)           |
 | **Search**          | BM25 + semantic + RRF                 | BM25 + semantic + RRF                   |
-| **Agent Interface** | MCP (stdio)                           | LangChain ReAct agent                   |
+| **Agent Interface** | MCP (stdio, or HTTP for multi-client) | LangChain ReAct agent                   |
 | **Visualization**   | —                                     | Sigma.js + Graphology (WebGL)           |
 | **Frontend**        | —                                     | React 18, TypeScript, Vite, Tailwind v4 |
 | **Clustering**      | Graphology                            | Graphology                              |

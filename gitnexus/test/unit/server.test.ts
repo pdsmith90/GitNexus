@@ -16,8 +16,10 @@ import { describe, it, expect, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js';
 import {
   createMCPServer,
+  getNextStepHint,
   installSignalShutdown,
   startMCPServer,
   SHUTDOWN_EXIT_CODES,
@@ -60,7 +62,7 @@ async function callToolThroughServer(
 
   try {
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-    const response = await client.callTool({ name, arguments: args });
+    const response = CallToolResultSchema.parse(await client.callTool({ name, arguments: args }));
     const text = response.content.find((item) => item.type === 'text')?.text;
     if (typeof text !== 'string') throw new Error('Expected an MCP text response');
     return { text, isError: response.isError === true };
@@ -302,6 +304,82 @@ describe('getNextStepHint (via tool call response)', () => {
     expect(text).toContain('startLine: <hit.line - 1>');
     expect(text).toContain('endLine: <hit.line - 1>');
     expect(text).toContain('Grep line is 1-based; read_file is 0-based');
+  });
+});
+
+describe('getNextStepHint rename', () => {
+  const apply =
+    'rename({symbol_uid: "Method:src/a.ts:A.run#0", new_name: "go", dry_run: false, plan_token: "<plan_token from this preview>", repo: "demo"})';
+
+  it.each([
+    ['omitted', { symbol_uid: 'Method:src/a.ts:A.run#0', new_name: 'go', repo: 'demo' }],
+    [
+      'true',
+      { symbol_uid: 'Method:src/a.ts:A.run#0', new_name: 'go', repo: 'demo', dry_run: true },
+    ],
+  ])('points a dry run (dry_run %s) at the apply call, not at detect_changes', (_label, args) => {
+    const hint = getNextStepHint('rename', args);
+    expect(hint).toContain(apply);
+    expect(hint).toContain('no files were changed');
+    expect(hint).not.toContain('detect_changes');
+  });
+
+  it('shows the detect_changes hint only after an explicit dry_run:false', () => {
+    const hint = getNextStepHint(
+      'rename',
+      { new_name: 'go', repo: 'demo', dry_run: false },
+      false,
+      { status: 'success', applied: true, application_status: 'applied' },
+    );
+    expect(hint).toContain('detect_changes({repo: "demo"})');
+    expect(hint).not.toContain('dry_run: false');
+  });
+
+  it.each([
+    ['the string "false"', 'false'],
+    ['null', null],
+    ['zero', 0],
+  ])('does not treat dry_run %s as an applied rename', (_label, dryRun) => {
+    const hint = getNextStepHint('rename', { new_name: 'go', dry_run: dryRun });
+    expect(hint).not.toContain('detect_changes');
+  });
+
+  it('names symbol_name, quoted, when no symbol_uid was sent and omits repo when absent', () => {
+    const hint = getNextStepHint('rename', { symbol_name: 'run "fast"', new_name: 'go' });
+    expect(hint).toContain(
+      'rename({symbol_name: "run \\"fast\\"", new_name: "go", dry_run: false, plan_token: "<plan_token from this preview>"})',
+    );
+  });
+
+  it('never suggests applying from a read-only server', () => {
+    const hint = getNextStepHint('rename', { new_name: 'go', dry_run: true }, true);
+    expect(hint).toContain('MCP read-only mode cannot apply it');
+    expect(hint).toContain('fresh preview from a server that permits writes');
+    expect(hint).toContain("that server's plan_token");
+    expect(hint).not.toContain('dry_run: false');
+    expect(hint).not.toContain('detect_changes');
+  });
+  it.each(['plan_required', 'invalid_plan', 'plan_mismatch', 'source_changed'])(
+    'requests a fresh preview when apply fails with %s',
+    (code) => {
+      const hint = getNextStepHint('rename', { dry_run: false }, false, {
+        status: 'error',
+        applied: false,
+        code,
+      });
+      expect(hint).toContain('fresh rename preview');
+      expect(hint).toContain('plan_token');
+      expect(hint).not.toContain('detect_changes');
+    },
+  );
+  it('directs partial operations to reconcile exact write lists before retrying', () => {
+    const hint = getNextStepHint('rename', { dry_run: false }, false, {
+      status: 'partial',
+      applied: true,
+      application_status: 'partial',
+    });
+    expect(hint).toContain('failed_files and unattempted_files');
+    expect(hint).not.toContain('detect_changes');
   });
 });
 
@@ -659,5 +737,99 @@ describe('installSignalShutdown (#1132)', () => {
     for (const code of received) {
       expect(typeof code).toBe('number');
     }
+  });
+});
+
+// Response filters are optional transport views. Backends and unfiltered bytes
+// retain their established contract, including hints and safety metadata.
+describe('MCP response filters', () => {
+  const payload = {
+    status: 'found',
+    symbol: { uid: 'Function:src/pay.ts:pay', name: 'pay' },
+    incoming: {
+      calls: [{ uid: 'Function:src/buy.ts:buy' }],
+      uses: [{ uid: 'Variable:src/ui.ts:handler' }],
+    },
+    outgoing: { calls: [{ uid: 'Function:src/db.ts:save' }] },
+    processes: [{ id: 'proc:checkout' }],
+    epistemic: 'lower-bound',
+    causes: { callableValueReferences: 1 },
+    warning: 'Dynamic dispatch unresolved',
+    staleness: { status: 'current', lastCommit: 'abc' },
+  };
+  it('preserves the exact default formatted response', async () => {
+    const backend = createMockBackend({ callTool: vi.fn().mockResolvedValue(payload) });
+    const args = { uid: payload.symbol.uid };
+    const { text, isError } = await callToolThroughServer(backend, 'context', args);
+    expect(isError).toBe(false);
+    expect(text).toBe(
+      JSON.stringify(payload, null, 2) + getNextStepHint('context', args, false, payload),
+    );
+    expect(backend.callTool).toHaveBeenCalledWith('context', args);
+  });
+  it.each(['context', 'explore'])(
+    'applies opt-in views for %s without sending filter options to the backend',
+    async (name) => {
+      const backend = createMockBackend({ callTool: vi.fn().mockResolvedValue(payload) });
+      const { text, isError } = await callToolThroughServer(backend, name, {
+        uid: payload.symbol.uid,
+        response_sections: ['incoming'],
+        relationTypes: ['CALLS'],
+      });
+      expect(isError).toBe(false);
+      const result = JSON.parse(text.split('\n\n---')[0]);
+      expect(result.incoming).toEqual({ calls: payload.incoming.calls });
+      expect(result.symbol).toEqual(payload.symbol);
+      expect(result.epistemic).toBe('lower-bound');
+      expect(result.causes).toEqual(payload.causes);
+      expect(result.warning).toBe(payload.warning);
+      expect(result.staleness).toEqual(payload.staleness);
+      expect(result).not.toHaveProperty('outgoing');
+      expect(result).not.toHaveProperty('processes');
+      expect(result.response_filter.omitted_relations).toEqual({ incoming: ['uses'] });
+      expect(backend.callTool).toHaveBeenCalledWith(name, { uid: payload.symbol.uid });
+    },
+  );
+  it.each(['query', 'search'])('selects query result sections through %s', async (name) => {
+    const data = {
+      processes: [{ id: 'proc:checkout' }],
+      process_symbols: [{ id: payload.symbol.uid, process_id: 'proc:checkout' }],
+      definitions: [],
+    };
+    const backend = createMockBackend({ callTool: vi.fn().mockResolvedValue(data) });
+    const { text, isError } = await callToolThroughServer(backend, name, {
+      search_query: 'pay',
+      response_sections: ['process_symbols', 'definitions'],
+    });
+    expect(isError).toBe(false);
+    const result = JSON.parse(text.split('\n\n---')[0]);
+    expect(result.process_symbols).toEqual(data.process_symbols);
+    expect(result.definitions).toEqual([]);
+    expect(result).not.toHaveProperty('processes');
+    expect(backend.callTool).toHaveBeenCalledWith(name, { search_query: 'pay' });
+  });
+  it.each([
+    { response_sections: ['risk'] },
+    { response_sections: [] },
+    { relationTypes: ['CALSL'] },
+    { response_sections: ['processes'], relationTypes: ['CALLS'] },
+    { response_sections: ['incoming'], repo: '@group' },
+  ])('rejects invalid filters before backend execution: %j', async (args) => {
+    const backend = createMockBackend();
+    const { isError } = await callToolThroughServer(backend, 'context', { name: 'pay', ...args });
+    expect(isError).toBe(true);
+    expect(backend.callTool).not.toHaveBeenCalled();
+  });
+  it('applies the existing byte budget after filtering, without changing the cutoff contract', async () => {
+    const backend = createMockBackend({ callTool: vi.fn().mockResolvedValue(payload) });
+    const { text, isError } = await callToolThroughServer(backend, 'context', {
+      uid: payload.symbol.uid,
+      response_sections: ['incoming'],
+      maxTokens: 8,
+    });
+    expect(isError).toBe(false);
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(32);
+    expect(text.endsWith('\n…')).toBe(true);
+    expect(backend.callTool).toHaveBeenCalledWith('context', { uid: payload.symbol.uid });
   });
 });
