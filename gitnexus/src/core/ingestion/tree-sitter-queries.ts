@@ -3084,12 +3084,21 @@ export const JULIA_QUERIES = `
   (type_head (identifier) @name)) @definition.struct
 (struct_definition
   (type_head (binary_expression . (identifier) @name))) @definition.struct
+; Parametric head (\`Box{T}\`, \`Box{T} <: Super\`): named by the base identifier
+(struct_definition
+  (type_head (parametrized_type_expression . (identifier) @name))) @definition.struct
+(struct_definition
+  (type_head (binary_expression . (parametrized_type_expression . (identifier) @name)))) @definition.struct
 
 ; ── Abstract types (Interface nodes) ──────────────────────────────────────────
 (abstract_definition
   (type_head (identifier) @name)) @definition.interface
 (abstract_definition
   (type_head (binary_expression . (identifier) @name))) @definition.interface
+(abstract_definition
+  (type_head (parametrized_type_expression . (identifier) @name))) @definition.interface
+(abstract_definition
+  (type_head (binary_expression . (parametrized_type_expression . (identifier) @name)))) @definition.interface
 
 ; ── Modules ───────────────────────────────────────────────────────────────────
 (module_definition

@@ -10,6 +10,17 @@ struct Square <: Shape
     side::Float64
 end
 
+# Parametric heads: nodes are named by the base type (`Box`), never `Box{T}`.
+abstract type Container{T} <: Shape end
+
+mutable struct Box{T<:Real} <: Container{T}
+    content::T
+end
+
+struct Tag <: Container{Int}
+    label::String
+end
+
 # Multiple dispatch: two methods of the generic function `area`.
 area(c::Circle) = 3.14159 * c.radius^2
 area(s::Square) = s.side * s.side

@@ -20,10 +20,12 @@ import type { SyntaxNode } from '../../utils/ast-helpers.js';
  */
 function extractStructOwnerName(node: SyntaxNode): string | undefined {
   const typeHead = node.namedChildren.find((c) => c.type === 'type_head');
-  const first = typeHead?.firstNamedChild;
-  if (first?.type === 'identifier') return first.text;
+  let first = typeHead?.firstNamedChild;
   // struct Foo <: Bar  →  binary_expression, first identifier is the struct name
-  if (first?.type === 'binary_expression') return first.firstNamedChild?.text;
+  if (first?.type === 'binary_expression') first = first.firstNamedChild;
+  // struct Foo{T}  →  parametrized_type_expression, named by its base identifier
+  if (first?.type === 'parametrized_type_expression') first = first.firstNamedChild;
+  if (first?.type === 'identifier') return first.text;
   return undefined;
 }
 

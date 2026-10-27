@@ -84,11 +84,14 @@ export function emitJuliaScopeCaptures(
 }
 
 /** The `<:` binary_expression inside a struct/abstract head has children
- *  `[Sub, <:, Super]`; return the two named identifier endpoints. */
+ *  `[Sub, <:, Super]`; return the two named identifier endpoints. A parametric
+ *  side (`Box{T}`, `Container{T}`) counts as its base identifier. */
 function subtypePair(head: SyntaxNode): { sub: string; sup: string } | null {
   const binary = head.namedChildren.find((c) => c.type === 'binary_expression');
   if (binary === undefined) return null;
-  const idents = binary.namedChildren.filter((c) => c.type === 'identifier');
+  const idents = binary.namedChildren
+    .map((c) => (c.type === 'parametrized_type_expression' ? c.firstNamedChild : c))
+    .filter((c): c is SyntaxNode => c !== null && c.type === 'identifier');
   if (idents.length < 2) return null;
   const sub = idents[0].text;
   const sup = idents[idents.length - 1].text;

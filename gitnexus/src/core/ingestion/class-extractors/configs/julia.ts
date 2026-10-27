@@ -17,12 +17,14 @@ import type { SyntaxNode } from '../../utils/ast-helpers.js';
  */
 
 /** struct/abstract name: `type_head → identifier` (simple) or
- *  `type_head → binary_expression → first identifier` (the `Foo` in `Foo <: Bar`). */
+ *  `type_head → binary_expression → first identifier` (the `Foo` in `Foo <: Bar`).
+ *  A parametric head (`Foo{T}`) is named by its base identifier. */
 function extractTypeHeadName(node: SyntaxNode): string | undefined {
   const typeHead = node.namedChildren.find((c) => c.type === 'type_head');
-  const first = typeHead?.firstNamedChild;
+  let first = typeHead?.firstNamedChild;
+  if (first?.type === 'binary_expression') first = first.firstNamedChild;
+  if (first?.type === 'parametrized_type_expression') first = first.firstNamedChild;
   if (first?.type === 'identifier') return first.text;
-  if (first?.type === 'binary_expression') return first.firstNamedChild?.text;
   return undefined;
 }
 

@@ -1146,13 +1146,19 @@ export const findEnclosingClassInfo = (
       // A `type_head` child (Julia struct/abstract head) carries the type name
       // in a nested position rather than a `name` field: `type_head → identifier`
       // (`struct Foo`) or `type_head → binary_expression → identifier` (the `Foo`
-      // in `struct Foo <: Bar`). Keyed on the node type, matching how this
-      // function already special-cases `type_declaration` / `struct_type` above.
+      // in `struct Foo <: Bar`). A parametric head (`Foo{T}`) is owned by its base
+      // identifier, the name its Struct node carries — never the `Foo{T}` text.
+      // Keyed on the node type, matching how this function already special-cases
+      // `type_declaration` / `struct_type` above.
       const typeHead = current.children?.find((c: SyntaxNode) => c.type === 'type_head');
-      const typeHeadName =
+      const typeHeadFirst =
         typeHead?.firstNamedChild?.type === 'binary_expression'
           ? typeHead.firstNamedChild.firstNamedChild
           : typeHead?.firstNamedChild;
+      const typeHeadName =
+        typeHeadFirst?.type === 'parametrized_type_expression'
+          ? typeHeadFirst.firstNamedChild
+          : typeHeadFirst;
       const nameNode =
         current.childForFieldName?.('name') ??
         typeHeadName ??

@@ -22,15 +22,26 @@ const JULIA_SCOPE_QUERY = `
 (abstract_definition) @scope.class
 (function_definition) @scope.function
 
-;; Declarations — struct (Struct) — simple head and \`Sub <: Super\` head
+;; Declarations — struct (Struct) — simple head and \`Sub <: Super\` head; a
+;; parametric head (\`Box{T}\`) declares its base identifier
 (struct_definition (type_head (identifier) @declaration.name)) @declaration.struct
 (struct_definition
   (type_head (binary_expression . (identifier) @declaration.name))) @declaration.struct
+(struct_definition
+  (type_head (parametrized_type_expression . (identifier) @declaration.name))) @declaration.struct
+(struct_definition
+  (type_head (binary_expression
+    . (parametrized_type_expression . (identifier) @declaration.name)))) @declaration.struct
 
 ;; Declarations — abstract type (Interface)
 (abstract_definition (type_head (identifier) @declaration.name)) @declaration.interface
 (abstract_definition
   (type_head (binary_expression . (identifier) @declaration.name))) @declaration.interface
+(abstract_definition
+  (type_head (parametrized_type_expression . (identifier) @declaration.name))) @declaration.interface
+(abstract_definition
+  (type_head (binary_expression
+    . (parametrized_type_expression . (identifier) @declaration.name)))) @declaration.interface
 
 ;; Declarations — functions (long form + short form \`f(x) = …\`)
 (function_definition

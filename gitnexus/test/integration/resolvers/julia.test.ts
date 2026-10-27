@@ -6,6 +6,7 @@
  *   - Struct nodes + HAS_PROPERTY for typed fields
  *   - abstract type → Interface node
  *   - `<:` subtyping → EXTENDS edges (Struct → Interface)
+ *   - parametric heads (`Box{T} <: Container{T}`) → base-name nodes, owners and EXTENDS
  *   - Module + Macro nodes
  *   - include(...) → IMPORTS edge (file → file)
  *   - free-call resolution (unique-name functions) → CALLS edges
@@ -42,9 +43,7 @@ describe('Julia extraction & scope resolution', () => {
   });
 
   it('emits Module and Macro nodes', () => {
-    expect(getNodesByLabel(result, 'Module')).toEqual(
-      expect.arrayContaining(['Geometry', 'App']),
-    );
+    expect(getNodesByLabel(result, 'Module')).toEqual(expect.arrayContaining(['Geometry', 'App']));
     expect(getNodesByLabel(result, 'Macro')).toContain('logshape');
   });
 
@@ -65,6 +64,27 @@ describe('Julia extraction & scope resolution', () => {
     expect(edges).toContain('Square → Shape');
     // The `<:` relationship must be EXTENDS, never IMPLEMENTS.
     expect(getRelationships(result, 'IMPLEMENTS')).toEqual([]);
+  });
+
+  it('names parametric types by their base name (`Box{T}` → Box)', () => {
+    expect(getNodesByLabel(result, 'Struct')).toEqual(expect.arrayContaining(['Box', 'Tag']));
+    expect(getNodesByLabel(result, 'Interface')).toContain('Container');
+    const names = [...getNodesByLabel(result, 'Struct'), ...getNodesByLabel(result, 'Interface')];
+    expect(names.filter((n) => n.includes('{'))).toEqual([]);
+  });
+
+  it('owns parametric struct fields (no HAS_PROPERTY from a missing owner)', () => {
+    const props = getRelationships(result, 'HAS_PROPERTY');
+    expect(edgeSet(props)).toEqual(expect.arrayContaining(['Box → content', 'Tag → label']));
+    // A dangling owner id (`Struct:…:Box{T<:Real}`) fails the graph DB load.
+    expect(props.filter((e) => e.sourceLabel === 'unknown').map((e) => e.source)).toEqual([]);
+  });
+
+  it('emits EXTENDS when either side of `<:` is parametric', () => {
+    const edges = edgeSet(getRelationships(result, 'EXTENDS'));
+    expect(edges).toEqual(
+      expect.arrayContaining(['Container → Shape', 'Box → Container', 'Tag → Container']),
+    );
   });
 
   it('resolves include(...) into a file → file IMPORTS edge', () => {
